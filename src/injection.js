@@ -28,6 +28,10 @@ window.postMessage('getotdtoken', '*');
 async function main() {
     let html = await fetch(chrome.runtime.getURL('/files/index.html')).then(r => r.text());
     document.documentElement.innerHTML = html;
+    // x.com serves <html lang="ar" dir="rtl"> for RTL account languages and innerHTML keeps
+    // root attributes, so pin the deck chrome to LTR (tweet bodies carry their own lang).
+    document.documentElement.setAttribute('dir', 'ltr');
+    document.documentElement.setAttribute('lang', 'en-US');
 
     let [challenge_js, interception_js, vendor_js, bundle_js, bundle_css, twitter_text] =
         await Promise.allSettled([
