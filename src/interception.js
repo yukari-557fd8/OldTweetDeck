@@ -313,13 +313,16 @@ function parseTweet(res) {
                 let limitation = result.limitedActionResults.limited_actions.find(
                     (l) => l.action === "Reply"
                 );
-                if (limitation) {
+                if (limitation && result.tweet?.legacy) {
                     result.tweet.legacy.limited_actions_text = limitation.prompt
                         ? limitation.prompt.subtext.text
                         : "This tweet has limitations to who can reply.";
                 }
-                result = result.tweet;
             }
+            // TweetWithVisibilityResults (mediaVisibilityResults, tweetInterstitial, ...) wraps the
+            // real tweet in `tweet`, with or without limitedActionResults. Without unwrapping it,
+            // retweeted_status stays undefined and TweetDeck falls back to the raw "RT @user:" text.
+            if (!result.legacy && result.tweet) result = result.tweet;
             if (
                 result.quoted_status_result &&
                 result.quoted_status_result.result &&
@@ -380,12 +383,13 @@ function parseTweet(res) {
                 }
             }
             tweet.retweeted_status = result.legacy;
-            if (tweet.retweeted_status && result.core.user_results.result.legacy) {
-                let user_result = result?.core?.user_results?.result;
+            if (tweet.retweeted_status && result.core?.user_results?.result) {
+                let user_result = result.core.user_results.result;
                 tweet.retweeted_status.text = tweet.retweeted_status.full_text;
                 tweet.retweeted_status.id = +tweet.retweeted_status.id_str;
                 tweet.retweeted_status.conversation_id = +tweet.retweeted_status.conversation_id_str;
-                tweet.retweeted_status.user = user_result.legacy;
+                // Same migration as the top-level tweet: user fields may live in core/avatar instead of legacy.
+                tweet.retweeted_status.user = user_result.legacy || {};
                 tweet.retweeted_status.user.id_str = tweet.retweeted_status.user_id_str;
                 tweet.retweeted_status.user.id = +tweet.retweeted_status.user_id_str;
                 if(!tweet.retweeted_status.user.profile_image_url && user_result?.avatar?.image_url) {
