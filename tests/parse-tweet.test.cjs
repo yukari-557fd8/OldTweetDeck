@@ -80,3 +80,27 @@ test('unavailable retweeted tweet does not throw', () => {
     assert.equal(tweet.retweeted_status, undefined);
     assert.equal(tweet.text, 'RT @alice: hello world');
 });
+
+test('tweet whose author is unavailable (user_results: {}) is skipped instead of throwing', () => {
+    const res = { __typename: 'Tweet', rest_id: '100', core: { user_results: {} }, legacy: { id_str: '100', conversation_id_str: '100', full_text: 'x', user_id_str: '1', entities: {} } };
+    assert.equal(loadParseTweet()(res), undefined);
+});
+
+test('quoted tweet whose author is unavailable is dropped but the tweet survives', () => {
+    const res = tweetResult('100', user('1', 'alice'), 'look at this');
+    res.legacy.is_quote_status = true;
+    res.quoted_status_result = { result: { __typename: 'Tweet', rest_id: '50', core: { user_results: {} }, legacy: { id_str: '50', conversation_id_str: '50', full_text: 'q', user_id_str: '9', entities: {} } } };
+    const tweet = loadParseTweet()(res);
+    assert.equal(tweet.text, 'look at this');
+    assert.equal(tweet.quoted_status, undefined);
+});
+
+test('quoted author without a legacy object is rebuilt from core/avatar', () => {
+    const res = tweetResult('100', user('1', 'alice'), 'look at this');
+    res.legacy.is_quote_status = true;
+    res.quoted_status_result = { result: tweetResult('50', user('9', 'carol', { legacy: false }), 'quoted text') };
+    const tweet = loadParseTweet()(res);
+    assert.equal(tweet.quoted_status.text, 'quoted text');
+    assert.equal(tweet.quoted_status.user.screen_name, 'carol');
+    assert.equal(tweet.quoted_status.user.id_str, '9');
+});

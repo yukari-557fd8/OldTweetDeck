@@ -243,6 +243,16 @@ function parseTweetCard(card) {
     }
 }
 
+// parseTweet throws on shapes it can't handle. Timelines must drop that one tweet rather
+// than fail the whole response, which TweetDeck shows as an empty "No recent Tweets" column.
+function safeParseTweet(res) {
+    try {
+        return parseTweet(res);
+    } catch (e) {
+        return undefined;
+    }
+}
+
 function parseTweet(res) {
     try {
 
@@ -262,7 +272,10 @@ function parseTweet(res) {
         if(!tweet.id) {
             tweet.id = +tweet.id_str;
         }
-        let result = res.core.user_results.result;
+        // Suspended or deleted authors come back as `user_results: {}`. Without an author the
+        // tweet can't be rendered, so skip it instead of throwing and failing the whole feed.
+        let result = res.core.user_results?.result;
+        if (!result) return;
         tweet.conversation_id = +tweet.conversation_id_str;
         tweet.text = tweet.full_text;
         // X is migrating user fields out of `legacy` into `core`/`avatar`/etc,
@@ -327,8 +340,7 @@ function parseTweet(res) {
                 result.quoted_status_result &&
                 result.quoted_status_result.result &&
                 result.quoted_status_result.result.legacy &&
-                result.quoted_status_result.result.core &&
-                result.quoted_status_result.result.core.user_results.result.legacy
+                result.quoted_status_result.result.core?.user_results?.result
             ) {
                 result.legacy.quoted_status = result.quoted_status_result.result.legacy;
                 const quotedCard = parseTweetCard(result.quoted_status_result.result.card);
@@ -338,7 +350,7 @@ function parseTweet(res) {
                 result.legacy.quoted_status.conversation_id = +result.legacy.quoted_status.conversation_id_str;
                 if (result.legacy.quoted_status) {
                     result.legacy.quoted_status.user =
-                        result.quoted_status_result.result.core.user_results.result.legacy;
+                        result.quoted_status_result.result.core.user_results.result.legacy || {};
                     result.legacy.quoted_status.user.id_str = result.legacy.quoted_status.user_id_str;
                     result.legacy.quoted_status.user.id = +result.legacy.quoted_status.user_id_str;
                     let user_result = result?.quoted_status_result?.result?.core?.user_results?.result;
@@ -476,13 +488,14 @@ function parseTweet(res) {
                 tweet.quoted_status.conversation_id = +tweet.quoted_status.conversation_id_str;
                 tweet.quoted_status.text = tweet.quoted_status.full_text;
                 if (tweet.quoted_status) {
-                    tweet.quoted_status.user = result.core.user_results.result.legacy;
+                    let user_result = result.core?.user_results?.result;
+                    // Same migration as above: the author may have no `legacy` but still have core/avatar.
+                    tweet.quoted_status.user = user_result ? (user_result.legacy || {}) : undefined;
                     if (!tweet.quoted_status.user) {
                         delete tweet.quoted_status;
                     } else {
                         tweet.quoted_status.user.id_str = tweet.quoted_status.user_id_str;
                         tweet.quoted_status.user.id = +tweet.quoted_status.user_id_str;
-                        let user_result = result?.core?.user_results?.result;
                         if(!tweet.quoted_status.user.profile_image_url && user_result?.avatar?.image_url) {
                             tweet.quoted_status.user.profile_image_url = user_result.avatar.image_url;
                             tweet.quoted_status.user.profile_image_url_https = tweet.quoted_status.user.profile_image_url.replace("http://", "https://");
@@ -843,7 +856,7 @@ const proxyRoutes = [
                 // thats a lot of trash https://lune.dimden.dev/0bf524e52eb.png
                 if (e.entryId.startsWith("tweet-")) {
                     let res = e.content.itemContent.tweet_results.result;
-                    let tweet = parseTweet(res);
+                    let tweet = safeParseTweet(res);
                     if (!tweet) continue;
                     if (
                         tweet.source &&
@@ -865,7 +878,7 @@ const proxyRoutes = [
                             !item.entryId.includes("promoted")
                         ) {
                             let res = item.item.itemContent.tweet_results.result;
-                            let tweet = parseTweet(res);
+                            let tweet = safeParseTweet(res);
                             if (!tweet) continue;
                             if (
                                 tweet.source &&
@@ -1025,7 +1038,7 @@ const proxyRoutes = [
             for (let e of list) {
                 if (e.entryId.startsWith("tweet-")) {
                     let res = e.content.itemContent.tweet_results.result;
-                    let tweet = parseTweet(res);
+                    let tweet = safeParseTweet(res);
                     if (tweet) {
                         tweets.push(tweet);
                     }
@@ -1035,7 +1048,7 @@ const proxyRoutes = [
                         let t = lt[i];
                         if (t.entryId.startsWith("tweet-") || t.entryId.includes("-tweet-")) {
                             let res = t.item.itemContent.tweet_results.result;
-                            let tweet = parseTweet(res);
+                            let tweet = safeParseTweet(res);
                             if (!tweet) continue;
                             tweets.push(tweet);
                         }
@@ -1194,7 +1207,7 @@ const proxyRoutes = [
             for (let entry of entries) {
                 if (entry.entryId.startsWith("tweet-")) {
                     let result = entry.content.itemContent.tweet_results.result;
-                    let tweet = parseTweet(result);
+                    let tweet = safeParseTweet(result);
                     if (tweet) {
                         tweets.push(tweet);
                     }
@@ -1204,7 +1217,7 @@ const proxyRoutes = [
                         let item = items[i];
                         let result = item.item.itemContent.tweet_results.result;
                         if (item.entryId.startsWith("tweet-") || item.entryId.includes("-tweet-")) {
-                            let tweet = parseTweet(result);
+                            let tweet = safeParseTweet(result);
                             if (tweet && tweet.user.id_str === xhr.storage.user_id) {
                                 tweets.push(tweet);
                             }
@@ -1224,7 +1237,7 @@ const proxyRoutes = [
                 (e) =>
                     e.entryId.startsWith("sq-cursor-bottom-") ||
                     e.entryId.startsWith("cursor-bottom-")
-            ).content.value;
+            )?.content?.value;
             if (bottomCursor) {
                 cursors[`${xhr.storage.user_id}-${tweets[tweets.length - 1].id_str}`] = bottomCursor;
             }
@@ -1246,7 +1259,7 @@ const proxyRoutes = [
                 pinEntry.entry.content.itemContent
             ) {
                 let result = pinEntry.entry.content.itemContent.tweet_results.result;
-                let pinnedTweet = parseTweet(result);
+                let pinnedTweet = safeParseTweet(result);
                 if (pinnedTweet) {
                     let tweetTimes = tweets.map((t) => [
                         t.id_str,
@@ -1340,7 +1353,7 @@ const proxyRoutes = [
             for (let entry of entries) {
                 if (entry.entryId.startsWith("tweet-")) {
                     let result = entry.content.itemContent.tweet_results.result;
-                    let tweet = parseTweet(result);
+                    let tweet = safeParseTweet(result);
                     if (tweet) {
                         tweets.push(tweet);
                     }
@@ -1350,7 +1363,7 @@ const proxyRoutes = [
                         let item = items[i];
                         let result = item.item.itemContent.tweet_results.result;
                         if (item.entryId.startsWith("tweet-") || item.entryId.includes("-tweet-")) {
-                            let tweet = parseTweet(result);
+                            let tweet = safeParseTweet(result);
                             if (tweet && tweet.user.id_str === xhr.storage.user_id) {
                                 tweets.push(tweet);
                             }
@@ -1371,7 +1384,7 @@ const proxyRoutes = [
                 (e) =>
                     e.entryId.startsWith("sq-cursor-bottom-") ||
                     e.entryId.startsWith("cursor-bottom-")
-            ).content.value;
+            )?.content?.value;
             if (cursor) {
                 cursors[`bookmarks-${tweets[tweets.length - 1].id_str}`] = cursor;
             }
@@ -1724,7 +1737,7 @@ const proxyRoutes = [
 
             let tweets = entries
                 .filter(e => e.entryId.startsWith('tweet-') && e.content.itemContent.tweet_results.result)
-                .map(e => parseTweet(e.content.itemContent.tweet_results.result))
+                .map(e => safeParseTweet(e.content.itemContent.tweet_results.result))
                 .filter(e => e);
 
             if (tweets.length === 0) return tweets;
@@ -1733,7 +1746,7 @@ const proxyRoutes = [
                 (e) =>
                     e.entryId.startsWith("sq-cursor-bottom-") ||
                     e.entryId.startsWith("cursor-bottom-")
-            ).content.value;
+            )?.content?.value;
             if (cursor) {
                 cursors[`${xhr.storage.user_id}-${tweets[tweets.length - 1].id_str}-likes`] = cursor;
             }
@@ -1885,7 +1898,7 @@ const proxyRoutes = [
                     if (entry.content.itemContent.promotedMetadata) {
                         continue;
                     }
-                    let tweet = parseTweet(result);
+                    let tweet = safeParseTweet(result);
                     if (!tweet) {
                         continue;
                     }
