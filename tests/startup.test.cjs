@@ -33,8 +33,11 @@ test('fresh startup waits for verification and persists valid defaults', async (
     await pending;
     assert.equal(s.loads, 1);
     assert.equal(s.state.client.settings.default_account, 'twitter:123');
-    assert.deepEqual(JSON.parse(s.storage.OTDfeeds), {});
-    assert.deepEqual(JSON.parse(s.storage.OTDcolumns), {});
+    assert.deepEqual(JSON.parse(s.storage['OTDfeeds:123']), {});
+    assert.deepEqual(JSON.parse(s.storage['OTDcolumns:123']), {});
+    assert.equal(JSON.parse(s.storage['OTDsettings:123']).default_account, 'twitter:123');
+    assert.equal(s.storage.OTDfeeds, undefined);
+    assert.equal(s.storage.OTDcolumns, undefined);
 });
 
 test('cached settings load without waiting for verification', async () => {
@@ -53,4 +56,41 @@ test('missing verification completes with an error and writes no defaults', asyn
     assert.equal(s.xhr._status, 503);
     assert.match(s.state.errors[0].message, /verification timed out/);
     assert.equal(s.storage.OTDsettings, undefined);
+    assert.equal(s.storage['OTDsettings:123'], undefined);
+});
+
+test('a legacy deck is migrated once onto the verified login', async () => {
+    const s = setup({
+        OTDverifiedUser: JSON.stringify({ id_str: '7' }),
+        OTDsettings: JSON.stringify({ default_account: 'twitter:7', theme: 'dark', global_filter: [{ matching: 'spam' }] }),
+        OTDcolumns: JSON.stringify({ a: { id: 'a' } }),
+        OTDcolumnIds: JSON.stringify(['a']),
+    });
+    await s.route.sendHandler(s.xhr);
+    assert.equal(s.state.client.settings.theme, 'dark');
+    assert.equal(s.state.client.settings.global_filter[0].matching, 'spam');
+    assert.deepEqual(Array.from(s.state.client.columns), ['a']);
+    assert.equal(s.storage.OTDstateMigrated, '7');
+    assert.equal(s.storage.OTDsettings, undefined);
+    assert.equal(JSON.parse(s.storage['OTDsettings:7']).theme, 'dark');
+});
+
+test('another login does not receive or overwrite the migrated deck', async () => {
+    const s = setup({
+        OTDverifiedUser: JSON.stringify({ id_str: '1' }),
+        'OTDsettings:1': JSON.stringify({ theme: 'dark', default_account: 'twitter:1' }),
+        'OTDcolumns:1': JSON.stringify({ col: { id: 'col' } }),
+        'OTDcolumnIds:1': JSON.stringify(['col']),
+        'OTDfeeds:1': JSON.stringify({ feed: { id: 'feed' } }),
+        OTDstateMigrated: '1',
+    });
+    await s.route.sendHandler(s.xhr);
+    assert.equal(s.state.client.settings.theme, 'dark');
+    vm.runInContext('verifiedUser = { id_str: "2" }; ensureAccount("2");', s.context);
+    const columnsRoute = vm.runInContext('proxyRoutes.find(r => r.path === "/1.1/tweetdeck/columns")', s.context);
+    columnsRoute.beforeSendBody({ storage: {} }, JSON.stringify([{ id: 'other', title: 'B' }]));
+    assert.equal(JSON.parse(s.storage['OTDcolumns:1']).col.id, 'col');
+    assert.equal(JSON.parse(s.storage['OTDcolumns:2']).other.title, 'B');
+    assert.equal(JSON.parse(s.storage['OTDsettings:1']).theme, 'dark');
+    assert.equal(s.storage['OTDsettings:2'], undefined);
 });

@@ -18,32 +18,117 @@ if(localStorage.OTDverifiedUser) {
         verifiedUser = null;
     }
 }
+// Deck state is per login account. Teams columns stay in that one deck: the key is the
+// verified login, not the x-act-as-user-id of a column. Older builds stored one global deck.
 let feeds = {};
-if(localStorage.OTDfeeds) {
-    try {
-        feeds = JSON.parse(localStorage.OTDfeeds);
-    } catch(e) {
-        console.warn(`Error parsing OTDfeeds.`, e);
-        feeds = {};
-    }
-}
 let columns = {};
-if(localStorage.OTDcolumns) {
+let settings;
+let activeAccountId = null;
+let pendingLegacyOwner = false;
+
+function hasStored(key) {
+    const value = localStorage[key];
+    // Browsers return null for a missing localStorage key. The test double returns undefined.
+    return value !== undefined && value !== null && value !== "";
+}
+
+function readStoredJSON(key) {
+    if (!hasStored(key)) return undefined;
     try {
-        columns = JSON.parse(localStorage.OTDcolumns);
-    } catch(e) {
-        console.warn(`Error parsing OTDcolumns.`, e);
-        columns = {};
+        return JSON.parse(localStorage[key]);
+    } catch (e) {
+        console.warn(`Error parsing ${key}.`, e);
+        return undefined;
     }
 }
-let settings;
-if(localStorage.OTDsettings) {
-    try {
-        settings = JSON.parse(localStorage.OTDsettings);
-    } catch(e) {
-        console.warn(`Error parsing OTDsettings.`, e);
-        settings = null;
+
+function stateKey(name, userId) {
+    return `OTD${name}:${userId}`;
+}
+
+function accountHasStoredState(userId) {
+    return ["feeds", "columns", "settings", "columnIds"].some((name) => hasStored(stateKey(name, userId)));
+}
+
+function hasLegacyBundle() {
+    return ["OTDfeeds", "OTDcolumns", "OTDsettings", "OTDcolumnIds"].some((key) => hasStored(key));
+}
+
+function columnIdsOfActive() {
+    const key = activeAccountId ? stateKey("columnIds", activeAccountId) : "OTDcolumnIds";
+    return readStoredJSON(key) || [];
+}
+
+function writeColumnIds(ids) {
+    const key = activeAccountId ? stateKey("columnIds", activeAccountId) : "OTDcolumnIds";
+    localStorage[key] = JSON.stringify(ids);
+}
+
+function persistAccountState() {
+    const suffix = activeAccountId ? `:${activeAccountId}` : "";
+    localStorage["OTDfeeds" + suffix] = JSON.stringify(feeds);
+    localStorage["OTDcolumns" + suffix] = JSON.stringify(columns);
+    if (settings) localStorage["OTDsettings" + suffix] = JSON.stringify(settings);
+}
+
+function loadStoredAccount(userId) {
+    feeds = readStoredJSON(stateKey("feeds", userId)) || {};
+    columns = readStoredJSON(stateKey("columns", userId)) || {};
+    const stored = readStoredJSON(stateKey("settings", userId));
+    settings = stored === undefined ? null : stored;
+    activeAccountId = String(userId);
+    pendingLegacyOwner = false;
+}
+
+// The global keys belong to whichever login opens TweetDeck first after this change.
+function migrateLegacyTo(userId) {
+    feeds = readStoredJSON("OTDfeeds") || {};
+    columns = readStoredJSON("OTDcolumns") || {};
+    const stored = readStoredJSON("OTDsettings");
+    settings = stored === undefined ? null : stored;
+    activeAccountId = String(userId);
+    pendingLegacyOwner = false;
+    const columnIds = readStoredJSON("OTDcolumnIds") || [];
+    persistAccountState();
+    writeColumnIds(columnIds);
+    localStorage.OTDstateMigrated = String(userId);
+    delete localStorage.OTDfeeds;
+    delete localStorage.OTDcolumns;
+    delete localStorage.OTDsettings;
+    delete localStorage.OTDcolumnIds;
+}
+
+function ensureAccount(userId) {
+    if (!userId) return;
+    userId = String(userId);
+    if (activeAccountId === userId) return;
+    if (pendingLegacyOwner && !localStorage.OTDstateMigrated) {
+        migrateLegacyTo(userId);
+        return;
     }
+    if (activeAccountId) persistAccountState();
+    if (accountHasStoredState(userId)) {
+        loadStoredAccount(userId);
+        return;
+    }
+    if (!localStorage.OTDstateMigrated && hasLegacyBundle()) {
+        migrateLegacyTo(userId);
+        return;
+    }
+    feeds = {};
+    columns = {};
+    settings = null;
+    activeAccountId = userId;
+    pendingLegacyOwner = false;
+}
+
+if (verifiedUser?.id_str) {
+    ensureAccount(verifiedUser.id_str);
+} else if (!localStorage.OTDstateMigrated && localStorage.OTDsettings) {
+    feeds = readStoredJSON("OTDfeeds") || {};
+    columns = readStoredJSON("OTDcolumns") || {};
+    settings = readStoredJSON("OTDsettings");
+    pendingLegacyOwner = true;
 }
 let seenNotifications = new Set();
 // Legacy chirp id -> the position we first handed out for it, so a notification that has to be
@@ -64,7 +149,7 @@ function exportState() {
         feeds, 
         columns,
         settings,
-        columnIds: localStorage.OTDcolumnIds ? JSON.parse(localStorage.OTDcolumnIds) : []
+        columnIds: columnIdsOfActive()
     })], {type: 'application/json'}));
     a.download = 'OTDState.json';
     a.click();
@@ -85,10 +170,11 @@ function importState() {
                 if(!data.feeds || !data.columns || !data.settings || !data.columnIds) {
                     throw new Error("Invalid file");
                 }
-                localStorage.OTDfeeds = JSON.stringify(data.feeds);
-                localStorage.OTDcolumns = JSON.stringify(data.columns);
-                localStorage.OTDsettings = JSON.stringify(data.settings);
-                localStorage.OTDcolumnIds = JSON.stringify(data.columnIds);
+                feeds = data.feeds;
+                columns = data.columns;
+                settings = data.settings;
+                persistAccountState();
+                writeColumnIds(data.columnIds);
                 location.reload();
             } catch(e) {
                 alert("Error parsing file");
@@ -100,19 +186,22 @@ function importState() {
 }
 
 function cleanUp() {
-    let ids = localStorage.OTDcolumnIds ? JSON.parse(localStorage.OTDcolumnIds) : [];
+    let ids = columnIdsOfActive();
     for(let columnId in columns) {
         if(!ids.includes(columnId)) {
             delete columns[columnId];
         }
     }
-    localStorage.OTDcolumns = JSON.stringify(columns);
+    const columnsJson = JSON.stringify(columns);
+    const columnsKey = activeAccountId ? stateKey("columns", activeAccountId) : "OTDcolumns";
+    localStorage[columnsKey] = columnsJson;
     for(let id in feeds) {
-        if(!localStorage.OTDcolumns.includes(id)) {
+        if(!columnsJson.includes(id)) {
             delete feeds[id];
         }
     }
-    localStorage.OTDfeeds = JSON.stringify(feeds);
+    const feedsKey = activeAccountId ? stateKey("feeds", activeAccountId) : "OTDfeeds";
+    localStorage[feedsKey] = JSON.stringify(feeds);
 }
 
 function getFollows(id = getCurrentUserId(), cursor = -1, count = 5000) {
@@ -1157,6 +1246,215 @@ function emulateResponse(xhr) {
 
 let counter = 0;
 let bookmarkTimes = {};
+
+// screen_name -> id, filled as GraphQL users are parsed, so adding a list member
+// can use the id TweetDeck's form does not send.
+const screenNameIds = {};
+const USER_BY_SCREEN_NAME_FEATURES = {"hidden_profile_subscriptions_enabled":true,"profile_label_improvements_pcf_label_in_post_enabled":true,"responsive_web_profile_redirect_enabled":true,"rweb_tipjar_consumption_enabled":false,"verified_phone_label_enabled":false,"subscriptions_verification_info_is_identity_verified_enabled":true,"subscriptions_verification_info_verified_since_enabled":true,"highlights_tweets_tab_ui_enabled":true,"responsive_web_twitter_article_notes_tab_enabled":true,"subscriptions_feature_can_gift_premium":false,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_timeline_navigation_enabled":true};
+const USER_BY_REST_ID_FEATURES = {"hidden_profile_subscriptions_enabled":true,"profile_label_improvements_pcf_label_in_post_enabled":true,"responsive_web_profile_redirect_enabled":true,"rweb_tipjar_consumption_enabled":false,"verified_phone_label_enabled":false,"highlights_tweets_tab_ui_enabled":true,"responsive_web_twitter_article_notes_tab_enabled":true,"subscriptions_feature_can_gift_premium":false,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_timeline_navigation_enabled":true};
+const LIST_MEMBER_MUTATION_FEATURES = {"profile_label_improvements_pcf_label_in_post_enabled":true,"responsive_web_profile_redirect_enabled":true,"rweb_tipjar_consumption_enabled":false,"verified_phone_label_enabled":false,"responsive_web_graphql_timeline_navigation_enabled":true};
+const LIST_MEMBERS_FEATURES = {"rweb_video_screen_enabled":false,"rweb_cashtags_enabled":true,"profile_label_improvements_pcf_label_in_post_enabled":true,"responsive_web_profile_redirect_enabled":true,"rweb_tipjar_consumption_enabled":false,"verified_phone_label_enabled":false,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_timeline_navigation_enabled":true,"premium_content_api_read_enabled":false,"communities_web_enable_tweet_community_results_fetch":true,"c9s_tweet_anatomy_moderator_badge_enabled":true,"responsive_web_grok_analyze_button_fetch_trends_enabled":false,"responsive_web_grok_analyze_post_followups_enabled":true,"rweb_cashtags_composer_attachment_enabled":true,"responsive_web_jetfuel_frame":true,"rweb_sports_post_context_enabled":true,"responsive_web_grok_share_attachment_enabled":true,"responsive_web_grok_annotations_enabled":true,"articles_preview_enabled":true,"responsive_web_edit_tweet_api_enabled":true,"rweb_conversational_replies_downvote_enabled":false,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":true,"view_counts_everywhere_api_enabled":true,"longform_notetweets_consumption_enabled":true,"responsive_web_twitter_article_tweet_consumption_enabled":true,"content_disclosure_indicator_enabled":true,"content_disclosure_ai_generated_indicator_enabled":true,"responsive_web_grok_show_grok_translated_post":true,"responsive_web_grok_analysis_button_from_backend":true,"post_ctas_fetch_enabled":false,"freedom_of_speech_not_reach_fetch_enabled":true,"standardized_nudges_misinfo":true,"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled":true,"longform_notetweets_rich_text_read_enabled":true,"longform_notetweets_inline_media_enabled":false,"responsive_web_nested_quote_preview_enabled":true,"responsive_web_grok_image_annotation_enabled":true,"responsive_web_grok_imagine_annotation_enabled":true,"responsive_web_grok_community_note_auto_translation_is_enabled":true,"responsive_web_enhance_cards_enabled":false};
+
+function rememberUser(user) {
+    if (user && user.screen_name && user.id_str) {
+        screenNameIds[String(user.screen_name).toLowerCase()] = String(user.id_str);
+    }
+}
+
+function legacyUserFromGraph(result) {
+    if (!result || result.__typename === "UserUnavailable") return null;
+    const legacy = result.legacy || {};
+    const id = result.rest_id || legacy.id_str;
+    const screen = legacy.screen_name || result.core?.screen_name;
+    if (!id || !screen) return null;
+    const image = String(legacy.profile_image_url_https || result.avatar?.image_url || "").replace("http://", "https://");
+    const user = Object.assign({}, legacy, {
+        id_str: String(id),
+        id: +id,
+        screen_name: screen,
+        name: legacy.name || result.core?.name || screen,
+        profile_image_url_https: image,
+        created_at: legacy.created_at || result.core?.created_at || "",
+    });
+    if (!user.profile_image_url) user.profile_image_url = image.replace("https://", "http://");
+    if (result.is_blue_verified || result.verification?.verified) user.verified = true;
+    if (result.privacy?.protected) user.protected = true;
+    if (result.relationship_perspectives?.muting) user.muting = true;
+    if (result.relationship_perspectives?.blocking) user.blocking = true;
+    if (result.location?.location && !user.location) user.location = result.location.location;
+    rememberUser(user);
+    return user;
+}
+
+function listMemberTimeline(data) {
+    return data?.data?.list?.members_timeline?.timeline
+        || data?.data?.list?.membersTimeline?.timeline
+        || null;
+}
+
+function listMemberEntries(data) {
+    const instructions = listMemberTimeline(data)?.instructions || [];
+    const add = instructions.find((i) => i.type === "TimelineAddEntries");
+    return add?.entries || [];
+}
+
+function listMemberMutationHeaders(xhr) {
+    xhr.modReqHeaders["Content-Type"] = "application/json";
+    xhr.modReqHeaders["X-Twitter-Active-User"] = "yes";
+    xhr.modReqHeaders["X-Twitter-Client-Language"] = "en";
+    xhr.modReqHeaders["Authorization"] = PUBLIC_TOKENS[0];
+    delete xhr.modReqHeaders["X-Twitter-Client-Version"];
+}
+
+function lookupUserId(screenName) {
+    const known = screenNameIds[String(screenName || "").toLowerCase()];
+    if (known) return Promise.resolve(known);
+    return new Promise((resolve, reject) => {
+        let req;
+        try {
+            req = new XMLHttpRequest();
+        } catch (e) {
+            reject(e);
+            return;
+        }
+        if (!req || typeof req.open !== "function") {
+            reject(new Error("user lookup unavailable"));
+            return;
+        }
+        const url = `${NEW_API}/AMIBMjtxEEATh4z8V9GtRg/UserByScreenName?${generateParams(
+            USER_BY_SCREEN_NAME_FEATURES,
+            { screen_name: screenName, withGrokTranslatedBio: true },
+            { withPayments: false, withAuxiliaryUserLabels: true }
+        )}`;
+        req.open("GET", url, true);
+        req.onload = () => {
+            try {
+                const data = JSON.parse(req.responseText);
+                const user = legacyUserFromGraph(data?.data?.user?.result);
+                if (!user) reject(new Error("missing user"));
+                else resolve(user.id_str);
+            } catch (e) {
+                reject(e);
+            }
+        };
+        req.onerror = () => reject(new Error("user lookup failed"));
+        req.send();
+    });
+}
+
+function legacyListFromGraph(data, fallback) {
+    const raw = data?.data?.list
+        || data?.data?.list_add_member
+        || data?.data?.listAddMember
+        || data?.data?.list_remove_member
+        || data?.data?.listRemoveMember;
+    const node = raw && typeof raw === "object" ? raw : {};
+    const id = node.id_str || node.rest_id || fallback.listId || "";
+    const owner = legacyUserFromGraph(node.user_results?.result || node.user_result?.result) || {
+        id_str: "0",
+        id: 0,
+        screen_name: "",
+        name: "",
+        profile_image_url_https: "",
+    };
+    const mode = String(node.mode || "public").toLowerCase();
+    return {
+        id_str: String(id),
+        id: +id || 0,
+        name: node.name || "",
+        description: node.description || "",
+        slug: node.slug || "",
+        full_name: node.full_name || node.name || "",
+        member_count: node.member_count ?? 0,
+        mode: mode === "private" ? "private" : "public",
+        user: owner,
+    };
+}
+
+function listMutationResult(xhr) {
+    if (xhr.storage.listResult) return xhr.storage.listResult;
+    let data;
+    try {
+        data = JSON.parse(xhr.responseText);
+    } catch (e) {
+        xhr._status = 503;
+        return { errors: [{ message: "Could not update list members" }] };
+    }
+    if (data?.errors && !data?.data) {
+        xhr._status = 503;
+        return { errors: [{ message: data.errors[0]?.message || "Could not update list members" }] };
+    }
+    return legacyListFromGraph(data, { listId: xhr.storage.listId });
+}
+
+function postListMember(listId, userId, queryId, operation) {
+    return new Promise((resolve, reject) => {
+        let req;
+        try {
+            req = new XMLHttpRequest();
+        } catch (e) {
+            reject(e);
+            return;
+        }
+        if (!req || typeof req.open !== "function") {
+            reject(new Error("list mutation unavailable"));
+            return;
+        }
+        req.open("POST", `${NEW_API}/${queryId}/${operation}`, true);
+        req.onload = () => {
+            try {
+                resolve(JSON.parse(req.responseText));
+            } catch (e) {
+                reject(e);
+            }
+        };
+        req.onerror = () => reject(new Error("list mutation failed"));
+        req.send(JSON.stringify({
+            variables: { listId, userId },
+            features: LIST_MEMBER_MUTATION_FEATURES,
+            queryId,
+        }));
+    });
+}
+
+function sendListMemberMutation(xhr, body) {
+    const params = new URLSearchParams(body || "");
+    const listId = params.get("list_id") || "";
+    const names = (params.get("screen_name") || "").split(",").map((name) => name.trim()).filter(Boolean);
+    xhr.storage.listId = listId;
+    Promise.all(names.map((name) => lookupUserId(name))).then(async (ids) => {
+        if (!listId || !ids.length || ids.some((id) => !id)) {
+            failWithoutRequest(xhr, "could not resolve a list member");
+            emulateResponse(xhr);
+            return;
+        }
+        if (!xhr.storage.many) {
+            xhr.send(JSON.stringify({
+                variables: { listId, userId: ids[0] },
+                features: LIST_MEMBER_MUTATION_FEATURES,
+                queryId: xhr.storage.queryId,
+            }));
+            return;
+        }
+        try {
+            let last;
+            for (const userId of ids) {
+                last = await postListMember(listId, userId, xhr.storage.queryId, xhr.storage.operation);
+            }
+            xhr.storage.listResult = legacyListFromGraph(last, { listId });
+            emulateResponse(xhr);
+        } catch (e) {
+            console.error(e);
+            failWithoutRequest(xhr, "could not add list members");
+            emulateResponse(xhr);
+        }
+    }).catch((e) => {
+        console.error(e);
+        failWithoutRequest(xhr, "could not resolve a list member");
+        emulateResponse(xhr);
+    });
+}
+
 const OriginalXHR = XMLHttpRequest;
 const proxyRoutes = [
     // Home timeline
@@ -1672,30 +1970,48 @@ const proxyRoutes = [
             try {
                 let url = new URL(xhr.modUrl);
                 let params = new URLSearchParams(url.search);
-                let variables = {
+                xhr.storage.variables = {
                     "count": 40,
                     "includePromotedContent":false
                 };
-                let features = {"graphql_timeline_v2_bookmark_timeline":true,"blue_business_profile_image_shape_enabled":true,"responsive_web_graphql_exclude_directive_enabled":true,"verified_phone_label_enabled":false,"responsive_web_graphql_timeline_navigation_enabled":true,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"tweetypie_unmention_optimization_enabled":true,"vibe_api_enabled":true,"responsive_web_edit_tweet_api_enabled":true,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":true,"view_counts_everywhere_api_enabled":true,"longform_notetweets_consumption_enabled":true,"tweet_awards_web_tipping_enabled":false,"freedom_of_speech_not_reach_fetch_enabled":true,"standardized_nudges_misinfo":true,"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled":false,"interactive_text_enabled":true,"responsive_web_text_conversations_enabled":false,"longform_notetweets_rich_text_read_enabled":true,"responsive_web_enhance_cards_enabled":false};
+                xhr.storage.features = {"graphql_timeline_v2_bookmark_timeline":true,"blue_business_profile_image_shape_enabled":true,"responsive_web_graphql_exclude_directive_enabled":true,"verified_phone_label_enabled":false,"responsive_web_graphql_timeline_navigation_enabled":true,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"tweetypie_unmention_optimization_enabled":true,"vibe_api_enabled":true,"responsive_web_edit_tweet_api_enabled":true,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":true,"view_counts_everywhere_api_enabled":true,"longform_notetweets_consumption_enabled":true,"tweet_awards_web_tipping_enabled":false,"freedom_of_speech_not_reach_fetch_enabled":true,"standardized_nudges_misinfo":true,"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled":false,"interactive_text_enabled":true,"responsive_web_text_conversations_enabled":false,"longform_notetweets_rich_text_read_enabled":true,"responsive_web_enhance_cards_enabled":false};
 
                 let max_id = params.get("max_id");
                 if (max_id) {
-                    let bn = BigInt(params.get("max_id"));
-                    bn += BigInt(1);
-                    if (cursors[`bookmarks-${bn}`]) {
-                        variables.cursor = cursors[`bookmarks-${bn}`];
-                    }
-                    if(bookmarkTimes[`${bn}`]) {
-                        xhr.storage.time = bookmarkTimes[`${bn}`];
-                    }
+                    xhr.storage.bn = String(BigInt(max_id) + 1n);
                 }
-
-                xhr.modUrl = `${NEW_API}/3OjEFzT2VjX-X7w4KYBJRg/Bookmarks?${generateParams(
-                    features,
-                    variables
-                )}`;
+                if (params.get("user_id")) xhr.storage.user_id = params.get("user_id");
             } catch (e) {
                 console.error(e);
+            }
+        },
+        // The acting account is only known once legacy has set x-act-as-user-id.
+        openHandler: deferOpen,
+        beforeSend: (xhr) => {
+            const user_id = requestUserId(xhr);
+            xhr.storage.user_id = user_id;
+            if (!xhr.storage.variables || !xhr.storage.features) {
+                openDeferred(xhr);
+                return;
+            }
+            const bn = xhr.storage.bn;
+            if (bn && cursors[`bookmarks-${user_id}-${bn}`]) {
+                xhr.storage.variables.cursor = cursors[`bookmarks-${user_id}-${bn}`];
+            }
+            if (bn && bookmarkTimes[`${user_id}:${bn}`] !== undefined) {
+                xhr.storage.time = bookmarkTimes[`${user_id}:${bn}`];
+            }
+            xhr.modUrl = `${NEW_API}/3OjEFzT2VjX-X7w4KYBJRg/Bookmarks?${generateParams(
+                xhr.storage.features,
+                xhr.storage.variables
+            )}`;
+            openDeferred(xhr);
+        },
+        sendHandler: (xhr, data) => {
+            if (xhr.storage.cancelled) {
+                emulateResponse(xhr);
+            } else {
+                xhr.send(data);
             }
         },
         beforeSendHeaders: (xhr) => {
@@ -1758,10 +2074,12 @@ const proxyRoutes = [
 
             if (tweets.length === 0) return tweets;
 
+            const user_id = xhr.storage.user_id || "0";
             for(let i = 0; i < tweets.length; i++) {
                 const tweet = tweets[i];
-                tweet.receiveTime = bookmarkTimes[tweet.id_str] ?? ((xhr.storage.time ?? Date.now()) - i);
-                bookmarkTimes[tweet.id_str] = tweet.receiveTime;
+                const timeKey = `${user_id}:${tweet.id_str}`;
+                tweet.receiveTime = bookmarkTimes[timeKey] ?? ((xhr.storage.time ?? Date.now()) - i);
+                bookmarkTimes[timeKey] = tweet.receiveTime;
             }
 
             let cursor = entries.find(
@@ -1770,7 +2088,7 @@ const proxyRoutes = [
                     e.entryId.startsWith("cursor-bottom-")
             )?.content?.value;
             if (cursor) {
-                cursors[`bookmarks-${tweets[tweets.length - 1].id_str}`] = cursor;
+                cursors[`bookmarks-${user_id}-${tweets[tweets.length - 1].id_str}`] = cursor;
             }
 
             return tweets;
@@ -2178,16 +2496,156 @@ const proxyRoutes = [
             return "";
         },
     },
-    // User profile
+    // User profile. REST users/show is gone; GraphQL ids are the ones current x.com publishes
+    // (twitter-openapi placeholder, 2026-10). A missing user stays an error: code 34 on
+    // users/show is what TweetDeck turns into "That user does not exist".
     {
         path: "/1.1/users/show.json",
         method: "GET",
+        beforeRequest: (xhr) => {
+            try {
+                const params = new URL(xhr.modUrl).searchParams;
+                const screenName = params.get("screen_name");
+                const userId = params.get("user_id");
+                xhr.storage.screen_name = screenName;
+                xhr.storage.user_id = userId;
+                if (userId) {
+                    xhr.modUrl = `${NEW_API}/mxaYWwt52eAb6OAzYHMVzg/UserByRestId?${generateParams(
+                        USER_BY_REST_ID_FEATURES,
+                        { userId, withSafetyModeUserFields: true }
+                    )}`;
+                } else {
+                    xhr.modUrl = `${NEW_API}/AMIBMjtxEEATh4z8V9GtRg/UserByScreenName?${generateParams(
+                        USER_BY_SCREEN_NAME_FEATURES,
+                        { screen_name: screenName || "", withGrokTranslatedBio: true },
+                        { withPayments: false, withAuxiliaryUserLabels: true }
+                    )}`;
+                }
+            } catch (e) {
+                console.error(e);
+            }
+        },
         beforeSendHeaders: (xhr) => {
+            xhr.modReqHeaders["Content-Type"] = "application/json";
             xhr.modReqHeaders["X-Twitter-Active-User"] = "yes";
             xhr.modReqHeaders["X-Twitter-Client-Language"] = "en";
             xhr.modReqHeaders["Authorization"] = PUBLIC_TOKENS[0];
             delete xhr.modReqHeaders["X-Twitter-Client-Version"];
         },
+        afterRequest: (xhr) => {
+            let data;
+            try {
+                data = JSON.parse(xhr.responseText);
+            } catch (e) {
+                xhr._status = 404;
+                return { errors: [{ code: 34, message: "That user does not exist" }] };
+            }
+            const result = data?.data?.user?.result;
+            const user = legacyUserFromGraph(result);
+            if (!user) {
+                xhr._status = 404;
+                return { errors: [{ code: 34, message: "That user does not exist" }] };
+            }
+            return user;
+        },
+    },
+    // List members. The edit-members modal reads one page (it asks for 5000 and does not follow
+    // next_cursor), so this returns the first GraphQL page, capped at 100.
+    {
+        path: "/1.1/lists/members.json",
+        method: "GET",
+        beforeRequest: (xhr) => {
+            try {
+                const params = new URL(xhr.modUrl).searchParams;
+                let count = parseInt(params.get("count") || "20", 10);
+                if (!count || count < 1) count = 20;
+                if (count > 100) count = 100;
+                const variables = { listId: params.get("list_id"), count };
+                const cursor = params.get("cursor");
+                if (cursor && cursor !== "-1" && cursor !== "0") variables.cursor = cursor;
+                xhr.modUrl = `${NEW_API}/yQ_0-CTekcCY2oFRTskpSw/ListMembers?${generateParams(
+                    LIST_MEMBERS_FEATURES,
+                    variables
+                )}`;
+            } catch (e) {
+                console.error(e);
+            }
+        },
+        beforeSendHeaders: (xhr) => {
+            xhr.modReqHeaders["Content-Type"] = "application/json";
+            xhr.modReqHeaders["X-Twitter-Active-User"] = "yes";
+            xhr.modReqHeaders["X-Twitter-Client-Language"] = "en";
+            xhr.modReqHeaders["Authorization"] = PUBLIC_TOKENS[0];
+            delete xhr.modReqHeaders["X-Twitter-Client-Version"];
+        },
+        afterRequest: (xhr) => {
+            let data;
+            try {
+                data = JSON.parse(xhr.responseText);
+            } catch (e) {
+                console.error(e);
+                xhr._status = 503;
+                return { errors: [{ message: "Could not read list members" }] };
+            }
+            if (data?.errors && !listMemberTimeline(data)) {
+                xhr._status = 503;
+                return { errors: [{ message: data.errors[0]?.message || "Could not read list members" }] };
+            }
+            const entries = listMemberEntries(data);
+            const users = [];
+            for (const entry of entries) {
+                const result = entry?.content?.itemContent?.user_results?.result
+                    || entry?.content?.itemContent?.userResults?.result
+                    || entry?.content?.content?.user_results?.result;
+                const user = legacyUserFromGraph(result);
+                if (user) users.push(user);
+            }
+            const bottom = entries.find((e) => e.entryId && (e.entryId.startsWith("cursor-bottom-") || e.entryId.startsWith("sq-cursor-bottom-")))?.content?.value;
+            return {
+                users,
+                next_cursor: 0,
+                next_cursor_str: bottom || "0",
+                previous_cursor: 0,
+                previous_cursor_str: "0",
+            };
+        },
+    },
+    {
+        path: "/1.1/lists/members/create.json",
+        method: "POST",
+        beforeRequest: (xhr) => {
+            xhr.storage.queryId = "-Kf1YVC1rNKkPvPFk7YXZw";
+            xhr.storage.operation = "ListAddMember";
+            xhr.modUrl = `${NEW_API}/-Kf1YVC1rNKkPvPFk7YXZw/ListAddMember`;
+        },
+        beforeSendHeaders: listMemberMutationHeaders,
+        sendHandler: (xhr, body) => { sendListMemberMutation(xhr, body); },
+        afterRequest: (xhr) => listMutationResult(xhr),
+    },
+    {
+        path: "/1.1/lists/members/destroy.json",
+        method: "POST",
+        beforeRequest: (xhr) => {
+            xhr.storage.queryId = "_2o1-wSMWGFSi5HUscn1Hw";
+            xhr.storage.operation = "ListRemoveMember";
+            xhr.modUrl = `${NEW_API}/_2o1-wSMWGFSi5HUscn1Hw/ListRemoveMember`;
+        },
+        beforeSendHeaders: listMemberMutationHeaders,
+        sendHandler: (xhr, body) => { sendListMemberMutation(xhr, body); },
+        afterRequest: (xhr) => listMutationResult(xhr),
+    },
+    {
+        path: "/1.1/lists/members/create_all.json",
+        method: "POST",
+        beforeRequest: (xhr) => {
+            xhr.storage.queryId = "-Kf1YVC1rNKkPvPFk7YXZw";
+            xhr.storage.operation = "ListAddMember";
+            xhr.storage.many = true;
+            xhr.modUrl = `${NEW_API}/-Kf1YVC1rNKkPvPFk7YXZw/ListAddMember`;
+        },
+        beforeSendHeaders: listMemberMutationHeaders,
+        sendHandler: (xhr, body) => { sendListMemberMutation(xhr, body); },
+        afterRequest: (xhr) => listMutationResult(xhr),
     },
     // Search
     {
@@ -2946,6 +3404,7 @@ const proxyRoutes = [
                 if(!xhr.storage.user_id && !data.errors) {
                     localStorage.OTDverifiedUser = JSON.stringify(data);
                     verifiedUser = data;
+                    if (data.id_str) ensureAccount(data.id_str);
                 } 
             } catch (e) {
                 console.error('error parsing verified user', e);
@@ -3045,12 +3504,13 @@ const proxyRoutes = [
                 }
                 await new Promise(resolve => setTimeout(resolve, 50));
             }
+            if (verifiedUser?.id_str) ensureAccount(verifiedUser.id_str);
             emulateResponse(xhr);
         },
         afterRequest: (xhr) => {
             const state = {
                 client: {
-                    columns: localStorage.OTDcolumnIds ? JSON.parse(localStorage.OTDcolumnIds) : [],
+                    columns: columnIdsOfActive(),
                     mtime: new Date().toISOString(),
                     name: "blackbird",
                     settings: settings ?? {
@@ -3080,7 +3540,7 @@ const proxyRoutes = [
             };
             if(!settings) {
                 settings = state.client.settings;
-                localStorage.OTDsettings = JSON.stringify(settings);
+                persistAccountState();
             }
             cleanUp();
             keepLegacyPollerCache();
@@ -3105,13 +3565,13 @@ const proxyRoutes = [
             let json = JSON.parse(body);
             console.log('state push', json);
             if(json.columns) {
-                localStorage.OTDcolumnIds = JSON.stringify(json.columns);
+                writeColumnIds(json.columns);
             }
             if(json.settings && settings) {
                 for(let key in json.settings) {
                     settings[key] = json.settings[key];
                 }
-                localStorage.OTDsettings = JSON.stringify(settings);
+                persistAccountState();
             }
             cleanUp();
             return body;
@@ -3140,7 +3600,7 @@ const proxyRoutes = [
                 feeds[id] = json[i];
             }
             xhr.storage.ids = ids;
-            localStorage.OTDfeeds = JSON.stringify(feeds);
+            persistAccountState();
             console.log('feeds push', json, ids);
             return body;
         },
@@ -3168,7 +3628,7 @@ const proxyRoutes = [
                 columns[id] = json[i];
             }
             xhr.storage.ids = ids;
-            localStorage.OTDcolumns = JSON.stringify(columns);
+            persistAccountState();
             console.log('columns push', json, ids);
             return body;
         },
