@@ -596,6 +596,217 @@ function keepLegacyPollerCache() {
     }
 }
 
+// ---- request plumbing shared by the timeline routes -------------------------------------------
+
+function getRequestHeader(xhr, name) {
+    const headers = xhr.modReqHeaders || {};
+    const wanted = name.toLowerCase();
+    for (const key in headers) {
+        if (key.toLowerCase() === wanted) return headers[key];
+    }
+    return undefined;
+}
+
+// Which account a legacy request acts for. Teams accounts arrive as an x-act-as-user-id header
+// that legacy only adds after open() (TD.net.ajax's beforeSend in bundle.js), so this is only
+// reliable from the Proxy's send() onwards; a request without the header is the login account.
+function requestUserId(xhr) {
+    const acting = getRequestHeader(xhr, "x-act-as-user-id");
+    if (acting) return String(acting);
+    if (xhr.storage && xhr.storage.user_id) return String(xhr.storage.user_id);
+    try {
+        const id = TD.storage.store.getTwitterLoginAccount()?.getUserID();
+        if (id) return String(id);
+    } catch (e) {
+        // no legacy store yet
+    }
+    try {
+        return getCurrentUserId();
+    } catch (e) {
+        return verifiedUser?.id_str ?? localStorage.twitterAccountID;
+    }
+}
+
+// Routes whose URL depends on the request headers defer the real open() to beforeSend.
+function deferOpen(xhr, method, url, async, username, password) {
+    xhr.storage.open = { method, async, username, password };
+}
+
+function openDeferred(xhr) {
+    const open = xhr.storage.open || { method: xhr.modMethod || "GET" };
+    xhr.open(open.method, xhr.modUrl, open.async ?? true, open.username ?? null, open.password ?? null);
+}
+
+// Answer legacy with a failed request without touching the network. Its error path neither
+// retries nor marks the feed as exhausted, unlike an empty 200.
+function failWithoutRequest(xhr, reason) {
+    console.warn(`OldTweetDeck: ${reason}`);
+    xhr.storage.cancelled = true;
+    xhr._status = 503;
+    xhr._statusText = reason;
+}
+
+// Legacy reads `status` before `responseText`, so a 200 whose body is only a GraphQL error would
+// reach FeedPoller as an empty page (which can end infinite scroll). The Proxy runs this once on
+// the first read of either, so the page can be failed instead; the parsed body is kept for
+// afterRequest.
+function graphqlPageInspector(timelineOf) {
+    return (xhr) => {
+        if (xhr.status < 200 || xhr.status >= 300) return;
+        let data;
+        try {
+            data = JSON.parse(xhr.responseText);
+        } catch (e) {
+            return;
+        }
+        xhr.storage.parsed = data;
+        if (!timelineOf(data)) {
+            console.warn("OldTweetDeck: GraphQL error page", data?.errors ?? data);
+            xhr._status = 503;
+            xhr._statusText = "GraphQL error";
+        }
+    };
+}
+
+// ---- timeline pages and cursors ---------------------------------------------------------------
+
+// One record per page a timeline route handed to legacy: the ids it contained and the cursors X
+// returned with it. Legacy derives max_id / since_id from whichever chirp sits at the edge of its
+// column, so every id of a page has to resolve to that page's cursors, not just the one at the end.
+const TIMELINE_PAGE_LIMIT = 300;
+const timelinePages = new Map();
+
+function rememberTimelinePage(feedKey, tweets, bottom, top) {
+    if (!tweets.length || (!bottom && !top)) return;
+    let pages = timelinePages.get(feedKey);
+    if (!pages) timelinePages.set(feedKey, (pages = []));
+    pages.push({ ids: new Set(tweets.map((t) => t.id_str)), bottom, top });
+    if (pages.length > TIMELINE_PAGE_LIMIT) pages.splice(0, pages.length - TIMELINE_PAGE_LIMIT);
+}
+
+function timelinePageOf(feedKey, tweetId) {
+    const pages = timelinePages.get(feedKey);
+    if (!pages) return undefined;
+    for (let i = pages.length - 1; i >= 0; i--) {
+        if (pages[i].ids.has(tweetId)) return pages[i];
+    }
+    return undefined;
+}
+
+function timelineCursor(feedKey, tweetId, edge) {
+    return timelinePageOf(feedKey, tweetId)?.[edge];
+}
+
+// The page below `tweetId` came back with nothing usable: point at the page after it, so the next
+// request for the same bound goes deeper instead of fetching the same page again.
+function advanceTimelineCursor(feedKey, tweetId, bottom) {
+    const page = timelinePageOf(feedKey, tweetId);
+    if (page && bottom) page.bottom = bottom;
+}
+
+function findCursor(entries, edge) {
+    const entry = entries.find(
+        (e) => e.entryId.startsWith(`sq-cursor-${edge}-`) || e.entryId.startsWith(`cursor-${edge}-`)
+    );
+    return entry?.content?.value ?? entry?.content?.operation?.cursor?.value;
+}
+
+// Legacy sorts a column by `receiveTime || id` (TwitterStatus.fromJSONObject in bundle.js). A
+// conversation module carries the older tweets a reply answers; by id those sink far below the
+// reply and can become the column's bottom chirp, the one legacy turns into max_id for infinite
+// scroll, after which every page below is discarded as "too new". Keep the thread together: the
+// newest tweet keeps its id as sort key and each older one sorts just above it, in thread order.
+function keepThreadTogether(thread) {
+    if (thread.length < 2) return thread;
+    const oldestFirst = [...thread].sort((a, b) => compareIds(a.id_str, b.id_str));
+    const newest = BigInt(oldestFirst[oldestFirst.length - 1].id_str);
+    oldestFirst.forEach((tweet, i) => {
+        const above = BigInt(oldestFirst.length - 1 - i);
+        if (above > 0n) tweet.receiveTime = String(newest + above);
+    });
+    return oldestFirst;
+}
+
+function compareIds(a, b) {
+    const x = BigInt(a), y = BigInt(b);
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+
+function sortNewestFirst(tweets) {
+    return tweets.sort((a, b) => compareIds(b.receiveTime ?? b.id_str, a.receiveTime ?? a.id_str));
+}
+
+// true when `id` is new for this account's Home feed; the set stays bounded.
+const SEEN_HOME_TWEET_LIMIT = 2000;
+function rememberHomeTweet(user_id, id) {
+    let seen = seenHomeTweets[user_id];
+    if (!(seen instanceof Set)) seen = seenHomeTweets[user_id] = new Set();
+    if (seen.has(id)) return false;
+    seen.add(id);
+    while (seen.size > SEEN_HOME_TWEET_LIMIT) {
+        seen.delete(seen.values().next().value);
+    }
+    return true;
+}
+
+// A cursor-top poll only returns what X files above that cursor. Every so often poll the top of
+// the timeline without a cursor instead, so a stale cursor (or anything X skipped) can't keep a
+// column frozen; legacy drops the duplicates by id.
+const TOP_RESYNC_INTERVAL = 10 * 60 * 1000;
+const topFetches = {};
+
+function topFetchDue(feedKey) {
+    return Date.now() - (topFetches[feedKey] ?? 0) >= TOP_RESYNC_INTERVAL;
+}
+
+function noteTopFetch(feedKey) {
+    topFetches[feedKey] = Date.now();
+}
+
+const HOME_TIMELINE_FEATURES = {"rweb_video_screen_enabled":false,"profile_label_improvements_pcf_label_in_post_enabled":true,"responsive_web_profile_redirect_enabled":false,"rweb_tipjar_consumption_enabled":true,"verified_phone_label_enabled":false,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_timeline_navigation_enabled":true,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"premium_content_api_read_enabled":false,"communities_web_enable_tweet_community_results_fetch":true,"c9s_tweet_anatomy_moderator_badge_enabled":true,"responsive_web_grok_analyze_button_fetch_trends_enabled":false,"responsive_web_grok_analyze_post_followups_enabled":true,"responsive_web_jetfuel_frame":true,"responsive_web_grok_share_attachment_enabled":true,"articles_preview_enabled":true,"responsive_web_edit_tweet_api_enabled":true,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":true,"view_counts_everywhere_api_enabled":true,"longform_notetweets_consumption_enabled":true,"responsive_web_twitter_article_tweet_consumption_enabled":true,"tweet_awards_web_tipping_enabled":false,"responsive_web_grok_show_grok_translated_post":false,"responsive_web_grok_analysis_button_from_backend":true,"creator_subscriptions_quote_tweet_preview_enabled":false,"freedom_of_speech_not_reach_fetch_enabled":true,"standardized_nudges_misinfo":true,"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled":true,"longform_notetweets_rich_text_read_enabled":true,"longform_notetweets_inline_media_enabled":true,"responsive_web_grok_image_annotation_enabled":true,"responsive_web_grok_imagine_annotation_enabled":true,"responsive_web_grok_community_note_auto_translation_is_enabled":false,"responsive_web_enhance_cards_enabled":false};
+function homeTimelineUrl(cursor) {
+    const variables = { count: 40, includePromotedContent: true, latestControlAvailable: true };
+    if (cursor) variables.cursor = cursor;
+    return `${NEW_API}/cWF3cqWadLlIXA6KJWhcew/HomeLatestTimeline?${generateParams(HOME_TIMELINE_FEATURES, variables)}`;
+}
+
+const NOTIFICATIONS_ALL_URL = `https://${location.hostname}/i/api/2/notifications/all.json?include_profile_interstitial_type=1&include_blocking=1&include_blocked_by=1&include_followed_by=1&include_want_retweets=1&include_mute_edge=1&include_can_dm=1&include_can_media_tag=1&include_ext_has_nft_avatar=1&include_ext_is_blue_verified=1&include_ext_verified_type=1&include_ext_profile_image_shape=1&skip_status=1&cards_platform=Web-12&include_cards=1&include_ext_alt_text=true&include_ext_limited_action_results=true&include_quote_count=true&include_reply_count=1&tweet_mode=extended&include_ext_views=true&include_entities=true&include_user_entities=true&include_ext_media_color=true&include_ext_media_availability=true&include_ext_sensitive_media_warning=true&include_ext_trusted_friends_metadata=true&send_error_codes=true&simple_quoted_tweet=true&count=20&requestContext=launch&ext=mediaStats%2ChighlightedLabel%2ChasNftAvatar%2CvoiceInfo%2CbirdwatchPivot%2CsuperFollowMetadata%2CunmentionInfo%2CeditControl`;
+function notificationsAllUrl(cursor) {
+    return `${NOTIFICATIONS_ALL_URL}${cursor ? `&cursor=${cursor}` : ""}`;
+}
+
+// Legacy marks a feed as exhausted below a page when a request returns fewer than ten chirps
+// (FeedPoller.EXHAUSTED_API_THRESHOLD in bundle.js) and never asks for older ones again. REST
+// pages were a steady 40, but ours are a GraphQL page minus promoted, muted and unparsable
+// entries, so a short page is normal: only an empty one should end infinite scroll. And an empty
+// first page (X over capacity) used to pin the feed as exhausted for good; lift that on refresh.
+let legacyFeedPollerPatched = false;
+function relaxLegacyExhaustion() {
+    if (legacyFeedPollerPatched) return;
+    try {
+        const Original = TD.controller.FeedPoller;
+        if (typeof Original !== "function") return;
+        const Patched = function (feed) {
+            Original.call(this, feed);
+            this.EXHAUSTED_API_THRESHOLD = 1;
+            const refresh = this.refresh;
+            this.refresh = function () {
+                const possible = this.intervalOfPossibility;
+                if (possible && possible.constructor && possible.constructor.whole) {
+                    this.intervalOfPossibility = possible.constructor.whole;
+                }
+                return refresh.apply(this, arguments);
+            };
+        };
+        Patched.prototype = Original.prototype;
+        Object.assign(Patched, Original);
+        TD.controller.FeedPoller = Patched;
+        legacyFeedPollerPatched = true;
+    } catch (e) {
+        // TD isn't loaded yet; the next state load tries again.
+    }
+}
+
 function getCurrentUserId() {
     let accounts = TD.storage.accountController.getAll();
     let screen_name = TD.storage.accountController.getUserIdentifier();
@@ -836,95 +1047,101 @@ const proxyRoutes = [
     {
         path: "/1.1/statuses/home_timeline.json",
         method: "GET",
+        inspectResponse: graphqlPageInspector((data) => data?.data?.home?.home_timeline_urt),
         beforeRequest: (xhr) => {
             try {
-                let url = new URL(xhr.modUrl);
-                let params = new URLSearchParams(url.search);
-                let variables = {"count":40,"includePromotedContent":true,"latestControlAvailable":true};
-                let features = {"rweb_video_screen_enabled":false,"profile_label_improvements_pcf_label_in_post_enabled":true,"responsive_web_profile_redirect_enabled":false,"rweb_tipjar_consumption_enabled":true,"verified_phone_label_enabled":false,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_timeline_navigation_enabled":true,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"premium_content_api_read_enabled":false,"communities_web_enable_tweet_community_results_fetch":true,"c9s_tweet_anatomy_moderator_badge_enabled":true,"responsive_web_grok_analyze_button_fetch_trends_enabled":false,"responsive_web_grok_analyze_post_followups_enabled":true,"responsive_web_jetfuel_frame":true,"responsive_web_grok_share_attachment_enabled":true,"articles_preview_enabled":true,"responsive_web_edit_tweet_api_enabled":true,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":true,"view_counts_everywhere_api_enabled":true,"longform_notetweets_consumption_enabled":true,"responsive_web_twitter_article_tweet_consumption_enabled":true,"tweet_awards_web_tipping_enabled":false,"responsive_web_grok_show_grok_translated_post":false,"responsive_web_grok_analysis_button_from_backend":true,"creator_subscriptions_quote_tweet_preview_enabled":false,"freedom_of_speech_not_reach_fetch_enabled":true,"standardized_nudges_misinfo":true,"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled":true,"longform_notetweets_rich_text_read_enabled":true,"longform_notetweets_inline_media_enabled":true,"responsive_web_grok_image_annotation_enabled":true,"responsive_web_grok_imagine_annotation_enabled":true,"responsive_web_grok_community_note_auto_translation_is_enabled":false,"responsive_web_enhance_cards_enabled":false};
-
-                let max_id = params.get("max_id");
-                let since_id = params.get("since_id");
-                let user_id = xhr.modReqHeaders["x-act-as-user-id"] ?? params.get("user_id") ?? getCurrentUserId();
-                if(params.get("user_id")) {
+                let params = new URL(xhr.modUrl).searchParams;
+                xhr.storage.max_id = params.get("max_id");
+                xhr.storage.since_id = params.get("since_id");
+                if (params.get("user_id")) {
                     xhr.storage.user_id = params.get("user_id");
                 }
-                if (max_id) {
-                    let bn = BigInt(params.get("max_id"));
-                    bn += BigInt(1);
-                    if (cursors[`home-${user_id}-${bn}`]) {
-                        variables.cursor = cursors[`home-${user_id}-${bn}`];
-                        // xhr.storage.cursor = true;
-                    }
-                }
-                if (since_id) {
-                    let bn = BigInt(params.get("since_id"));
-                    if (cursors[`home-${user_id}-${bn}-top`]) {
-                        variables.cursor = cursors[`home-${user_id}-${bn}-top`];
-                        xhr.storage.cursor = true;
-                        xhr.storage.since_id = since_id;
-                    }
-                }
-                xhr.modUrl = `${NEW_API}/cWF3cqWadLlIXA6KJWhcew/HomeLatestTimeline?${generateParams(
-                    features,
-                    variables
-                )}`;
+                // Legacy adds x-act-as-user-id after open(), so which account's cursor to use is
+                // only known in beforeSend; until then this is the cursor-less URL.
+                xhr.modUrl = homeTimelineUrl();
             } catch (e) {
                 console.error(e);
             }
         },
-        openHandler: (xhr, method, url, async, username, password) => {
-            let user_id = xhr.modReqHeaders["x-act-as-user-id"] ?? xhr.storage.user_id ?? getCurrentUserId();
+        openHandler: deferOpen,
+        beforeSend: (xhr) => {
+            const user_id = requestUserId(xhr);
             xhr.storage.user_id = user_id;
-            if(!timings.home[user_id]) {
+            const feedKey = `home-${user_id}`;
+            const { max_id, since_id } = xhr.storage;
+            let cursor;
+            if (max_id) {
+                const requested = String(BigInt(max_id) + 1n);
+                cursor = timelineCursor(feedKey, requested, "bottom");
+                if (!cursor) {
+                    // Legacy wants tweets below a chirp we never handed it. The only thing we could
+                    // fetch is the top of the timeline, which it would discard and retry five times.
+                    failWithoutRequest(xhr, `no bottom cursor for home max_id=${max_id}`);
+                    return;
+                }
+                xhr.storage.requested_id = requested;
+            } else if (since_id && !topFetchDue(feedKey)) {
+                cursor = timelineCursor(feedKey, since_id, "top");
+                if (cursor) {
+                    xhr.storage.cursor = true;
+                } else {
+                    noteTopFetch(feedKey);
+                }
+            } else {
+                noteTopFetch(feedKey);
+            }
+            if (!timings.home[user_id]) {
                 timings.home[user_id] = 0;
             }
-            if(Date.now() - timings.home[user_id] < refreshInterval && xhr.storage.cursor && Math.random() > 0.6) {
+            if (Date.now() - timings.home[user_id] < refreshInterval && xhr.storage.cursor && Math.random() > 0.6) {
                 xhr.storage.cancelled = true;
-            } else {
-                xhr.open(method, url, async, username, password);
-                timings.home[user_id] = Date.now();
+                return;
             }
+            xhr.modUrl = homeTimelineUrl(cursor);
+            openDeferred(xhr);
+            timings.home[user_id] = Date.now();
         },
         sendHandler: (xhr, data) => {
-            if(xhr.storage.cancelled) {
+            if (xhr.storage.cancelled) {
                 emulateResponse(xhr);
             } else {
                 xhr.send(data);
             }
         },
         beforeSendHeaders: (xhr) => {
-            xhr.storage.user_id = xhr.modReqHeaders["x-act-as-user-id"] ?? getCurrentUserId();
             xhr.modReqHeaders["Content-Type"] = "application/json";
             xhr.modReqHeaders["X-Twitter-Active-User"] = "yes";
             xhr.modReqHeaders["X-Twitter-Client-Language"] = "en";
             xhr.modReqHeaders["Authorization"] = PUBLIC_TOKENS[0];
             delete xhr.modReqHeaders["X-Twitter-Client-Version"];
-            // updateFollows(xhr.storage.user_id);
         },
         afterRequest: (xhr) => {
-            if(xhr.storage.cancelled) {
+            if (xhr.storage.cancelled || xhr._status) {
                 return [];
             }
-            if(xhr.storage.data) {
+            if (xhr.storage.data) {
                 return xhr.storage.data;
             }
-            let data;
-            try {
-                data = JSON.parse(xhr.responseText);
-            } catch (e) {
-                console.error(e);
+            let data = xhr.storage.parsed;
+            if (!data) {
+                try {
+                    data = JSON.parse(xhr.responseText);
+                } catch (e) {
+                    console.error(e);
+                    return [];
+                }
+            }
+            const timeline = data?.data?.home?.home_timeline_urt;
+            if (!timeline) {
+                if (data?.errors) console.warn("OldTweetDeck: home timeline errors", data.errors);
                 return [];
             }
-            if (data.errors && data.errors[0]) {
-                return [];
-            }
-            let instructions = data.data.home.home_timeline_urt.instructions;
-            let entries = instructions.find((i) => i.type === "TimelineAddEntries");
+            let entries = timeline.instructions?.find((i) => i.type === "TimelineAddEntries")?.entries;
             if (!entries) {
                 return [];
             }
-            entries = entries.entries;
+            const user_id = xhr.storage.user_id;
+            const feedKey = `home-${user_id}`;
             let tweets = [];
             for (let e of entries) {
                 // thats a lot of trash https://lune.dimden.dev/0bf524e52eb.png
@@ -944,7 +1161,7 @@ const proxyRoutes = [
                 } else if (e.entryId.startsWith("home-conversation-")) {
                     let items = e.content.items;
 
-                    let pushTweets = [];
+                    let thread = [];
                     for (let i = 0; i < items.length; i++) {
                         let item = items[i];
                         if (
@@ -965,9 +1182,9 @@ const proxyRoutes = [
                                 tweet.feedback = item.item.feedbackInfo.feedbackKeys
                                     .map(
                                         (f) =>
-                                            data.data.home.home_timeline_urt.responseObjects.feedbackActions.find(
+                                            timeline.responseObjects?.feedbackActions?.find(
                                                 (a) => a.key === f
-                                            ).value
+                                            )?.value
                                     )
                                     .filter((f) => f);
                                 if (tweet.feedback) {
@@ -975,52 +1192,32 @@ const proxyRoutes = [
                                         item.item.feedbackInfo.feedbackMetadata;
                                 }
                             }
-                            pushTweets.push(tweet);
+                            thread.push(tweet);
                         }
                     }
-                    if(!seenHomeTweets[xhr.storage.user_id]) {
-                        seenHomeTweets[xhr.storage.user_id] = [];
-                    }
-                    for(let tweet of pushTweets) {
-                        if(xhr.storage.since_id && seenHomeTweets[xhr.storage.user_id].includes(tweet.id_str)) continue;
-                        seenHomeTweets[xhr.storage.user_id].push(tweet.id_str);
+                    for (let tweet of keepThreadTogether(thread)) {
+                        // a poll re-sends the context of a thread the column already shows
+                        if (xhr.storage.since_id && !rememberHomeTweet(user_id, tweet.id_str)) continue;
                         tweets.push(tweet);
                     }
                 }
             }
 
-            if (tweets.length === 0) return tweets;
-
-            // i didn't know they return tweets unsorted???
-            tweets.sort(
-                (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-            );
-            if(!seenHomeTweets[xhr.storage.user_id]) {
-                seenHomeTweets[xhr.storage.user_id] = [];
-            }
-            for(let tweet of tweets) {
-                if(seenHomeTweets[xhr.storage.user_id].includes(tweet.id_str)) continue;
-                seenHomeTweets[xhr.storage.user_id].push(tweet.id_str);
+            const bottomCursor = findCursor(entries, "bottom");
+            if (tweets.length === 0) {
+                // Nothing survived the filters but there may be more below: let the next request
+                // for the same bound go one page deeper instead of fetching this one again.
+                if (xhr.storage.requested_id && bottomCursor) {
+                    advanceTimelineCursor(feedKey, xhr.storage.requested_id, bottomCursor);
+                }
+                return tweets;
             }
 
-            let bottomCursor = entries.find(
-                (e) =>
-                    e.entryId.startsWith("sq-cursor-bottom-") ||
-                    e.entryId.startsWith("cursor-bottom-")
-            );
-            if (bottomCursor) {
-                cursors[`home-${xhr.storage.user_id}-${tweets[tweets.length - 1].id_str}`] =
-                    bottomCursor.content.value;
+            sortNewestFirst(tweets);
+            for (let tweet of tweets) {
+                rememberHomeTweet(user_id, tweet.id_str);
             }
-            let topCursor = entries.find(
-                (e) =>
-                    e.entryId.startsWith("sq-cursor-top-") ||
-                    e.entryId.startsWith("cursor-top-")
-            )?.content?.value;
-            if (topCursor) {
-                if(tweets[0]) cursors[`home-${xhr.storage.user_id}-${tweets[0].id_str}-top`] = topCursor;
-                if(tweets[1]) cursors[`home-${xhr.storage.user_id}-${tweets[1].id_str}-top`] = topCursor;
-            }
+            rememberTimelinePage(feedKey, tweets, bottomCursor, findCursor(entries, "top"));
 
             xhr.storage.data = tweets;
 
@@ -1031,6 +1228,7 @@ const proxyRoutes = [
     {
         path: "/1.1/lists/statuses.json",
         method: "GET",
+        inspectResponse: graphqlPageInspector((data) => data?.data?.list?.tweets_timeline?.timeline),
         beforeRequest: (xhr) => {
             try {
                 let url = new URL(xhr.modUrl);
@@ -1041,20 +1239,27 @@ const proxyRoutes = [
                 let list_id = params.get("list_id");
                 let max_id = params.get("max_id");
                 let since_id = params.get("since_id");
+                const feedKey = `list-${list_id}`;
+                xhr.storage.max_id = max_id;
                 if (max_id) {
-                    let bn = BigInt(params.get("max_id"));
-                    bn += BigInt(1);
-                    if (cursors[`list-${list_id}-${bn}`]) {
-                        variables.cursor = cursors[`list-${list_id}-${bn}`];
-                        xhr.storage.cursor = true;
+                    const requested = String(BigInt(max_id) + 1n);
+                    const cursor = timelineCursor(feedKey, requested, "bottom");
+                    if (cursor) {
+                        variables.cursor = cursor;
+                        xhr.storage.requested_id = requested;
+                    } else {
+                        xhr.storage.missingCursor = true;
                     }
-                }
-                if (since_id) {
-                    let bn = BigInt(params.get("since_id"));
-                    if (cursors[`list-${list_id}-${bn}-top`]) {
-                        variables.cursor = cursors[`list-${list_id}-${bn}-top`];
+                } else if (since_id && !topFetchDue(feedKey)) {
+                    const cursor = timelineCursor(feedKey, since_id, "top");
+                    if (cursor) {
+                        variables.cursor = cursor;
                         xhr.storage.cursor = true;
+                    } else {
+                        noteTopFetch(feedKey);
                     }
+                } else {
+                    noteTopFetch(feedKey);
                 }
                 variables.listId = list_id;
                 xhr.storage.list_id = list_id;
@@ -1078,10 +1283,12 @@ const proxyRoutes = [
             if(!timings.list[list_id]) {
                 timings.list[list_id] = 0;
             }
-            if(Date.now() - timings.list[list_id] < refreshInterval && xhr.storage.cursor) {
+            if (xhr.storage.missingCursor) {
+                failWithoutRequest(xhr, `no bottom cursor for list ${list_id} max_id=${xhr.storage.max_id}`);
+            } else if(Date.now() - timings.list[list_id] < refreshInterval && xhr.storage.cursor) {
                 xhr.storage.cancelled = true;
             } else {
-                xhr.open(method, url, async, username, password);
+                xhr.open(method, url, async ?? true, username, password);
                 timings.list[list_id] = Date.now();
             }
         },
@@ -1093,15 +1300,17 @@ const proxyRoutes = [
             }
         },
         afterRequest: (xhr) => {
-            if(xhr.storage.cancelled) {
+            if(xhr.storage.cancelled || xhr._status) {
                 return [];
             }
-            let data;
-            try {
-                data = JSON.parse(xhr.responseText);
-            } catch (e) {
-                console.error(e);
-                return [];
+            let data = xhr.storage.parsed;
+            if (!data) {
+                try {
+                    data = JSON.parse(xhr.responseText);
+                } catch (e) {
+                    console.error(e);
+                    return [];
+                }
             }
             let list = data?.data?.list?.tweets_timeline?.timeline?.instructions?.find(
                 (i) => i.type === "TimelineAddEntries"
@@ -1118,45 +1327,32 @@ const proxyRoutes = [
                     }
                 } else if (e.entryId.startsWith("list-conversation-")) {
                     let lt = e.content.items;
+                    let thread = [];
                     for (let i = 0; i < lt.length; i++) {
                         let t = lt[i];
                         if (t.entryId.startsWith("tweet-") || t.entryId.includes("-tweet-")) {
                             let res = t.item.itemContent.tweet_results.result;
                             let tweet = safeParseTweet(res);
                             if (!tweet) continue;
-                            tweets.push(tweet);
+                            thread.push(tweet);
                         }
                     }
+                    tweets.push(...keepThreadTogether(thread));
                 }
             }
 
-            if (tweets.length === 0) return tweets;
-
             tweets = tweets.filter(t => !t.user.muting && !t.user.blocking);
 
-            // i didn't know they return tweets unsorted???
-            tweets.sort(
-                (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-            )
-
-            let bottomCursor = list.find(
-                (e) =>
-                    e.entryId.startsWith("sq-cursor-bottom-") ||
-                    e.entryId.startsWith("cursor-bottom-")
-            );
-            if (bottomCursor) {
-                cursors[`list-${xhr.storage.list_id}-${tweets[tweets.length - 1].id_str}`] =
-                    bottomCursor.content.value;
+            const feedKey = `list-${xhr.storage.list_id}`;
+            const bottomCursor = findCursor(list, "bottom");
+            if (tweets.length === 0) {
+                if (xhr.storage.requested_id && bottomCursor) {
+                    advanceTimelineCursor(feedKey, xhr.storage.requested_id, bottomCursor);
+                }
+                return tweets;
             }
-            let topCursor = list.find(
-                (e) =>
-                    e.entryId.startsWith("sq-cursor-top-") ||
-                    e.entryId.startsWith("cursor-top-")
-            )?.content?.value;
-            if (topCursor) {
-                if(tweets[0]) cursors[`list-${xhr.storage.list_id}-${tweets[0].id_str}-top`] = topCursor;
-                if(tweets[1]) cursors[`list-${xhr.storage.list_id}-${tweets[1].id_str}-top`] = topCursor;
-            }
+            sortNewestFirst(tweets);
+            rememberTimelinePage(feedKey, tweets, bottomCursor, findCursor(list, "top"));
 
             return tweets;
         },
@@ -1165,6 +1361,7 @@ const proxyRoutes = [
     {
         path: "/1.1/statuses/user_timeline.json",
         method: "GET",
+        inspectResponse: graphqlPageInspector((data) => data?.data?.user?.result?.timeline_v2?.timeline),
         beforeRequest: (xhr) => {
             try {
                 let url = new URL(xhr.modUrl);
@@ -1207,20 +1404,27 @@ const proxyRoutes = [
                 }
                 let since_id = params.get("since_id");
                 let max_id = params.get("max_id");
+                const feedKey = `user-${variables.userId}`;
+                xhr.storage.max_id = max_id;
                 if (max_id) {
-                    let bn = BigInt(params.get("max_id"));
-                    bn += BigInt(1);
-                    if (cursors[`${variables.userId}-${bn}`]) {
-                        variables.cursor = cursors[`${variables.userId}-${bn}`];
-                        xhr.storage.cursor = true;
+                    const requested = String(BigInt(max_id) + 1n);
+                    const cursor = timelineCursor(feedKey, requested, "bottom");
+                    if (cursor) {
+                        variables.cursor = cursor;
+                        xhr.storage.requested_id = requested;
+                    } else {
+                        xhr.storage.missingCursor = true;
                     }
-                }
-                if (since_id) {
-                    let bn = BigInt(params.get("since_id"));
-                    if (cursors[`${variables.userId}-${bn}-top`]) {
-                        variables.cursor = cursors[`${variables.userId}-${bn}-top`];
+                } else if (since_id && !topFetchDue(feedKey)) {
+                    const cursor = timelineCursor(feedKey, since_id, "top");
+                    if (cursor) {
+                        variables.cursor = cursor;
                         xhr.storage.cursor = true;
+                    } else {
+                        noteTopFetch(feedKey);
                     }
+                } else {
+                    noteTopFetch(feedKey);
                 }
                 xhr.storage.user_id = variables.userId;
 
@@ -1246,10 +1450,12 @@ const proxyRoutes = [
             if(!timings.user[user_id]) {
                 timings.user[user_id] = 0;
             }
-            if(Date.now() - timings.user[user_id] < refreshInterval && xhr.storage.cursor) {
+            if (xhr.storage.missingCursor) {
+                failWithoutRequest(xhr, `no bottom cursor for user ${user_id} max_id=${xhr.storage.max_id}`);
+            } else if(Date.now() - timings.user[user_id] < refreshInterval && xhr.storage.cursor) {
                 xhr.storage.cancelled = true;
             } else {
-                xhr.open(method, url, async, username, password);
+                xhr.open(method, url, async ?? true, username, password);
                 timings.user[user_id] = Date.now();
             }
         },
@@ -1261,15 +1467,17 @@ const proxyRoutes = [
             }
         },
         afterRequest: (xhr) => {
-            if(xhr.storage.cancelled) {
+            if(xhr.storage.cancelled || xhr._status) {
                 return [];
             }
-            let data;
-            try {
-                data = JSON.parse(xhr.responseText);
-            } catch (e) {
-                console.error(e);
-                return [];
+            let data = xhr.storage.parsed;
+            if (!data) {
+                try {
+                    data = JSON.parse(xhr.responseText);
+                } catch (e) {
+                    console.error(e);
+                    return [];
+                }
             }
             let instructions = data?.data?.user?.result?.timeline_v2?.timeline?.instructions;
             let entries = instructions?.find((e) => e.type === "TimelineAddEntries");
@@ -1287,43 +1495,31 @@ const proxyRoutes = [
                     }
                 } else if (entry.entryId.startsWith("profile-conversation-")) {
                     let items = entry.content.items;
+                    let thread = [];
                     for (let i = 0; i < items.length; i++) {
                         let item = items[i];
                         let result = item.item.itemContent.tweet_results.result;
                         if (item.entryId.startsWith("tweet-") || item.entryId.includes("-tweet-")) {
                             let tweet = safeParseTweet(result);
                             if (tweet && tweet.user.id_str === xhr.storage.user_id) {
-                                tweets.push(tweet);
+                                thread.push(tweet);
                             }
                         }
                     }
+                    tweets.push(...keepThreadTogether(thread));
                 }
             }
 
-            if (tweets.length === 0) return tweets;
-
-            // i didn't know they return tweets unsorted???
-            tweets.sort(
-                (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-            );
-
-            let bottomCursor = entries.find(
-                (e) =>
-                    e.entryId.startsWith("sq-cursor-bottom-") ||
-                    e.entryId.startsWith("cursor-bottom-")
-            )?.content?.value;
-            if (bottomCursor) {
-                cursors[`${xhr.storage.user_id}-${tweets[tweets.length - 1].id_str}`] = bottomCursor;
+            const feedKey = `user-${xhr.storage.user_id}`;
+            const bottomCursor = findCursor(entries, "bottom");
+            if (tweets.length === 0) {
+                if (xhr.storage.requested_id && bottomCursor) {
+                    advanceTimelineCursor(feedKey, xhr.storage.requested_id, bottomCursor);
+                }
+                return tweets;
             }
-            let topCursor = entries.find(
-                (e) =>
-                    e.entryId.startsWith("sq-cursor-top-") ||
-                    e.entryId.startsWith("cursor-top-")
-            )?.content?.value;
-            if (topCursor) {
-                if(tweets[0]) cursors[`${xhr.storage.user_id}-${tweets[0].id_str}-top`] = topCursor;
-                if(tweets[1]) cursors[`${xhr.storage.user_id}-${tweets[1].id_str}-top`] = topCursor;
-            }
+            sortNewestFirst(tweets);
+            rememberTimelinePage(feedKey, tweets, bottomCursor, findCursor(entries, "top"));
 
             let pinEntry = instructions.find((e) => e.type === "TimelinePinEntry");
             if (
@@ -1471,21 +1667,36 @@ const proxyRoutes = [
         path: "/1.1/activity/about_me.json",
         method: "GET",
         beforeRequest: (xhr) => {
-            const params = new URLSearchParams(xhr.modUrl);
-            const since_id = params.get("since_id");
-            const max_id = params.get("max_id");
-            const user_id = xhr.modReqHeaders["x-act-as-user-id"] ?? params.get("user_id") ?? getCurrentUserId();
+            const params = new URL(xhr.modUrl).searchParams;
+            xhr.storage.since_id = params.get("since_id");
+            xhr.storage.max_id = params.get("max_id");
+            if (params.get("user_id")) {
+                xhr.storage.user_id = params.get("user_id");
+            }
+            xhr.modUrl = notificationsAllUrl();
+        },
+        // Which account's cursor applies is only known once legacy has set its headers.
+        openHandler: deferOpen,
+        beforeSend: (xhr) => {
+            const user_id = requestUserId(xhr);
+            xhr.storage.user_id = user_id;
             let cursor;
-            if(since_id && cursors[`notifications-${user_id}-top`]) {
+            if (xhr.storage.since_id && cursors[`notifications-${user_id}-top`]) {
                 cursor = cursors[`notifications-${user_id}-top`];
-            } else if(max_id && cursors[`notifications-${user_id}-bottom`]) {
+            } else if (xhr.storage.max_id && cursors[`notifications-${user_id}-bottom`]) {
                 cursor = cursors[`notifications-${user_id}-bottom`];
             }
-
-            xhr.modUrl = `https://${location.hostname}/i/api/2/notifications/all.json?include_profile_interstitial_type=1&include_blocking=1&include_blocked_by=1&include_followed_by=1&include_want_retweets=1&include_mute_edge=1&include_can_dm=1&include_can_media_tag=1&include_ext_has_nft_avatar=1&include_ext_is_blue_verified=1&include_ext_verified_type=1&include_ext_profile_image_shape=1&skip_status=1&cards_platform=Web-12&include_cards=1&include_ext_alt_text=true&include_ext_limited_action_results=true&include_quote_count=true&include_reply_count=1&tweet_mode=extended&include_ext_views=true&include_entities=true&include_user_entities=true&include_ext_media_color=true&include_ext_media_availability=true&include_ext_sensitive_media_warning=true&include_ext_trusted_friends_metadata=true&send_error_codes=true&simple_quoted_tweet=true&count=20&requestContext=launch&ext=mediaStats%2ChighlightedLabel%2ChasNftAvatar%2CvoiceInfo%2CbirdwatchPivot%2CsuperFollowMetadata%2CunmentionInfo%2CeditControl${cursor ? `&cursor=${cursor}` : ''}`;
+            xhr.modUrl = notificationsAllUrl(cursor);
+            openDeferred(xhr);
+        },
+        sendHandler: (xhr, data) => {
+            if (xhr.storage.cancelled) {
+                emulateResponse(xhr);
+            } else {
+                xhr.send(data);
+            }
         },
         beforeSendHeaders: (xhr) => {
-            xhr.storage.user_id = xhr.modReqHeaders["x-act-as-user-id"] ?? getCurrentUserId();
             xhr.modReqHeaders["Content-Type"] = "application/json";
             xhr.modReqHeaders["X-Twitter-Active-User"] = "yes";
             xhr.modReqHeaders["X-Twitter-Client-Language"] = navigator.language.split("-")[0];
@@ -1662,22 +1873,37 @@ const proxyRoutes = [
             "x-rate-limit-remaining": (value) => value == null ? value : Math.floor(+value / 2),
         },
         beforeRequest: (xhr) => {
-            const params = new URLSearchParams(xhr.modUrl);
-            const since_id = params.get("since_id");
-            const max_id = params.get("max_id");
-            const user_id = xhr.modReqHeaders["x-act-as-user-id"] ?? params.get("user_id") ?? getCurrentUserId();
-            xhr.storage.user_id = user_id;
-            let cursor;
-            if(since_id && cursors[`mentions-${user_id}-top`]) {
-                cursor = cursors[`mentions-${user_id}-top`];
-            } else if(max_id && cursors[`mentions-${user_id}-bottom`]) {
-                cursor = cursors[`mentions-${user_id}-bottom`];
+            const params = new URL(xhr.modUrl).searchParams;
+            xhr.storage.since_id = params.get("since_id");
+            xhr.storage.max_id = params.get("max_id");
+            if (params.get("user_id")) {
+                xhr.storage.user_id = params.get("user_id");
             }
-
             // X's mentions.json lags the "all" notifications timeline by half an hour or more and does
             // not catch up while being polled, so fetch the all.json page instead and keep only the
             // mention / reply / quote entries below (the cursors stay under their own `mentions-` keys).
-            xhr.modUrl = `https://${location.hostname}/i/api/2/notifications/all.json?include_profile_interstitial_type=1&include_blocking=1&include_blocked_by=1&include_followed_by=1&include_want_retweets=1&include_mute_edge=1&include_can_dm=1&include_can_media_tag=1&include_ext_has_nft_avatar=1&include_ext_is_blue_verified=1&include_ext_verified_type=1&include_ext_profile_image_shape=1&skip_status=1&cards_platform=Web-12&include_cards=1&include_ext_alt_text=true&include_ext_limited_action_results=true&include_quote_count=true&include_reply_count=1&tweet_mode=extended&include_ext_views=true&include_entities=true&include_user_entities=true&include_ext_media_color=true&include_ext_media_availability=true&include_ext_sensitive_media_warning=true&include_ext_trusted_friends_metadata=true&send_error_codes=true&simple_quoted_tweet=true&count=20&requestContext=launch&ext=mediaStats%2ChighlightedLabel%2ChasNftAvatar%2CvoiceInfo%2CbirdwatchPivot%2CsuperFollowMetadata%2CunmentionInfo%2CeditControl${cursor ? `&cursor=${cursor}` : ''}`;
+            xhr.modUrl = notificationsAllUrl();
+        },
+        // Which account's cursor applies is only known once legacy has set its headers.
+        openHandler: deferOpen,
+        beforeSend: (xhr) => {
+            const user_id = requestUserId(xhr);
+            xhr.storage.user_id = user_id;
+            let cursor;
+            if (xhr.storage.since_id && cursors[`mentions-${user_id}-top`]) {
+                cursor = cursors[`mentions-${user_id}-top`];
+            } else if (xhr.storage.max_id && cursors[`mentions-${user_id}-bottom`]) {
+                cursor = cursors[`mentions-${user_id}-bottom`];
+            }
+            xhr.modUrl = notificationsAllUrl(cursor);
+            openDeferred(xhr);
+        },
+        sendHandler: (xhr, data) => {
+            if (xhr.storage.cancelled) {
+                emulateResponse(xhr);
+            } else {
+                xhr.send(data);
+            }
         },
         beforeSendHeaders: (xhr) => {
             xhr.modReqHeaders["Content-Type"] = "application/json";
@@ -2781,6 +3007,7 @@ const proxyRoutes = [
             }
             cleanUp();
             keepLegacyPollerCache();
+            relaxLegacyExhaustion();
             console.log('account state', state);
 
             return state;
@@ -2954,6 +3181,17 @@ XMLHttpRequest = function () {
             this.modReqHeaders[name] = value;
         },
         async send(body = null) {
+            // The route may still need the headers legacy set after open() (the acting account)
+            // to finish its URL, so it gets one last look before anything is sent.
+            if (this.proxyRoute && this.proxyRoute.beforeSend) {
+                try {
+                    this.proxyRoute.beforeSend(this);
+                } catch (e) {
+                    console.error(e);
+                    this.storage.cancelled = true;
+                    this._status = 503;
+                }
+            }
             let parsedUrl = new URL(this.modUrl);
             let method = this.modMethod;
             if(!method) {
@@ -3012,6 +3250,20 @@ XMLHttpRequest = function () {
         },
         get(xhr, key) {
             if (!key in xhr) return undefined;
+            if (
+                (key === "status" || key === "statusText" || key === "responseText") &&
+                xhr.readyState === 4 && !xhr._inspected &&
+                xhr.proxyRoute && xhr.proxyRoute.inspectResponse
+            ) {
+                // Legacy reads status before responseText, so a route that wants to fail a 200
+                // whose body is only an error looks at the response here, once, before either.
+                xhr._inspected = true;
+                try {
+                    xhr.proxyRoute.inspectResponse(xhr);
+                } catch (e) {
+                    console.error(e);
+                }
+            }
             if (key === "responseText" && xhr._responseText) return xhr._responseText;
             if (key === "responseText") return this.interceptResponseText(xhr);
             if (key === "readyState" && xhr._readyState) return xhr._readyState;

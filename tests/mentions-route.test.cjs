@@ -14,9 +14,10 @@ function loadRoute() {
     return vm.runInContext('proxyRoutes', context).find(r => r.path === '/1.1/statuses/mentions_timeline.json');
 }
 
-const legacyRequest = (query) => ({
+const legacyRequest = (query, actAs = '42') => ({
     modUrl: 'https://api.x.com/1.1/statuses/mentions_timeline.json?' + query,
-    modReqHeaders: { 'x-act-as-user-id': '42' }, storage: {},
+    modReqHeaders: { 'x-act-as-user-id': actAs }, storage: {},
+    open(method, url) { this.opened = url; },
 });
 const user = (id) => ({ id_str: id, screen_name: 'user' + id, name: 'User ' + id });
 const tweet = (id, userId, extra = {}) => ({ id_str: id, user_id_str: userId, full_text: 'tweet ' + id, entities: {}, ...extra });
@@ -37,19 +38,22 @@ function allJsonPage(entries, { tweets = [], users = [] } = {}) {
 
 test('mentions are read from the all.json notifications timeline, with their own cursors', () => {
     const route = loadRoute();
-    const first = legacyRequest('count=40');
-    route.beforeRequest(first);
+    // legacy adds x-act-as-user-id between open() and send(), so the cursor is only picked in beforeSend
+    const prepare = (xhr) => { route.beforeRequest(xhr); route.beforeSend(xhr); return xhr; };
+    const first = prepare(legacyRequest('count=40'));
     assert.ok(first.modUrl.startsWith('https://x.com/i/api/2/notifications/all.json?'), first.modUrl);
     assert.ok(!first.modUrl.includes('cursor='), 'initial load carries no cursor');
+    assert.equal(first.opened, first.modUrl);
 
     route.afterRequest({ storage: { user_id: '42' }, responseText: allJsonPage([]) });
 
-    const newer = legacyRequest('count=40&since_id=5');
-    route.beforeRequest(newer);
+    const newer = prepare(legacyRequest('count=40&since_id=5'));
     assert.ok(newer.modUrl.endsWith('&cursor=TOP'), newer.modUrl);
-    const older = legacyRequest('count=40&max_id=5');
-    route.beforeRequest(older);
+    const older = prepare(legacyRequest('count=40&max_id=5'));
     assert.ok(older.modUrl.endsWith('&cursor=BOTTOM'), older.modUrl);
+    // another account's request must not borrow 42's cursors
+    const other = prepare(legacyRequest('count=40&since_id=5', '43'));
+    assert.ok(!other.modUrl.includes('cursor='), other.modUrl);
 });
 
 test('only mention, reply and quote entries of the page become tweets', () => {
