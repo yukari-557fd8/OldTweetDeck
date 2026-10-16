@@ -248,15 +248,88 @@ function parseTweetCard(card) {
 
 // parseTweet throws on shapes it can't handle. Timelines must drop that one tweet rather
 // than fail the whole response, which TweetDeck shows as an empty "No recent Tweets" column.
-function safeParseTweet(res) {
+function safeParseTweet(res, options) {
     try {
-        return parseTweet(res);
+        return parseTweet(res, options);
     } catch (e) {
         return undefined;
     }
 }
 
-function parseTweet(res) {
+function userHidden(user) {
+    return !!(user && (user.muting || user.blocking));
+}
+
+// Drop a tweet whose author, or the author of a retweet, is muted or blocked.
+// A quote of such a user loses the quoted tweet and keeps the outer one.
+function tweetHidden(tweet) {
+    if (!tweet) return false;
+    if (userHidden(tweet.user) || userHidden(tweet.retweeted_status?.user)) return true;
+    if (userHidden(tweet.quoted_status?.user)) {
+        delete tweet.quoted_status;
+        tweet.is_quote_status = false;
+    }
+    if (userHidden(tweet.retweeted_status?.quoted_status?.user)) {
+        delete tweet.retweeted_status.quoted_status;
+    }
+    return false;
+}
+
+function isPromoted(entry) {
+    const id = entry?.entryId || "";
+    if (id.includes("promoted")) return true;
+    const itemContent = entry?.content?.itemContent || entry?.item?.itemContent;
+    return !!itemContent?.promotedMetadata;
+}
+
+// A video unified card has no legacy card TweetDeck can play. Hand it the same
+// media object a native video tweet carries, and the column player uses it.
+function mediaFromUnifiedCard(card) {
+    const legacy = card?.legacy;
+    if (!legacy || legacy.name !== "unified_card") return null;
+    const bindings = Array.isArray(legacy.binding_values)
+        ? Object.fromEntries(legacy.binding_values.filter(entry => entry?.key && entry.value).map(entry => [entry.key, entry.value]))
+        : legacy.binding_values || {};
+    let payload;
+    try {
+        payload = JSON.parse(bindings.unified_card?.string_value);
+    } catch (e) {
+        return null;
+    }
+    const objects = payload?.component_objects || {};
+    const slides = payload?.layout?.data?.slides;
+    const order = Array.isArray(slides) && slides.length ? slides.flat() : payload?.components;
+    if (!Array.isArray(order)) return null;
+    const mediaKey = order.find(key => ["media", "swipeable_media"].includes(objects[key]?.type));
+    const component = objects[mediaKey];
+    const slot = component?.type === "swipeable_media" ? component.data?.media_list?.[0] : component?.data;
+    const media = payload.media_entities?.[slot?.id];
+    if (!media || (media.type !== "video" && media.type !== "animated_gif")) return null;
+    const variants = media.video_info?.variants;
+    if (!Array.isArray(variants) || !variants.some(variant => variant?.content_type === "video/mp4" && variant.url)) return null;
+    return {
+        id_str: String(media.id_str || media.id || slot.id),
+        media_url_https: media.media_url_https || media.media_url,
+        type: media.type,
+        sizes: media.sizes || {},
+        video_info: media.video_info,
+        original_info: media.original_info,
+    };
+}
+
+function presentCard(tweet, card) {
+    if (!tweet || !card) return;
+    const media = mediaFromUnifiedCard(card);
+    if (media) {
+        if (!tweet.extended_entities?.media?.length) tweet.extended_entities = { media: [media] };
+        return;
+    }
+    const parsed = parseTweetCard(card);
+    if (parsed) tweet.card = parsed;
+}
+
+function parseTweet(res, options) {
+    const expandNotes = options?.expandNotes ?? localStorage.OTDenableAutoExpand === "1";
     try {
 
         if (typeof res !== "object") return;
@@ -346,8 +419,7 @@ function parseTweet(res) {
                 result.quoted_status_result.result.core?.user_results?.result
             ) {
                 result.legacy.quoted_status = result.quoted_status_result.result.legacy;
-                const quotedCard = parseTweetCard(result.quoted_status_result.result.card);
-                if (quotedCard) result.legacy.quoted_status.card = quotedCard;
+                presentCard(result.legacy.quoted_status, result.quoted_status_result.result.card);
                 result.legacy.quoted_status.id = +result.legacy.quoted_status.id_str;
                 result.legacy.quoted_status.text = result.legacy.quoted_status.full_text;
                 result.legacy.quoted_status.conversation_id = +result.legacy.quoted_status.conversation_id_str;
@@ -447,14 +519,16 @@ function parseTweet(res) {
                 if (result.views) {
                     tweet.retweeted_status.ext.views = { r: { ok: { count: +result.views.count } } };
                 }
-                const retweetedCard = parseTweetCard(result.card);
-                if (retweetedCard) tweet.retweeted_status.card = retweetedCard;
+                presentCard(tweet.retweeted_status, result.card);
             } else {
                 console.warn("No retweeted status", result);
             }
-            if (result.note_tweet && result.note_tweet.note_tweet_results && localStorage.OTDenableAutoExpand === "1") {
+            // With autoexpand off, leave the truncated text. It ends in "…" and
+            // TweetDeck adds an Expand tweet link. statuses/show passes expandNotes.
+            if (expandNotes && result.note_tweet && result.note_tweet.note_tweet_results) {
                 let note = parseNoteTweet(result);
                 tweet.retweeted_status.full_text = note.text;
+                tweet.retweeted_status.text = note.text;
                 tweet.retweeted_status.entities = note.entities;
                 tweet.retweeted_status.display_text_range = undefined; // no text range for long tweets
             }
@@ -463,9 +537,10 @@ function parseTweet(res) {
         if (res.quoted_status_result) {
             tweet.quoted_status_result = res.quoted_status_result;
         }
-        if (res.note_tweet && res.note_tweet.note_tweet_results) {
+        if (expandNotes && res.note_tweet && res.note_tweet.note_tweet_results) {
             let note = parseNoteTweet(res);
             tweet.full_text = note.text;
+            tweet.text = note.text;
             tweet.entities = note.entities;
             tweet.display_text_range = undefined; // no text range for long tweets
         }
@@ -485,8 +560,7 @@ function parseTweet(res) {
             }
             if(result && result.legacy) {
                 tweet.quoted_status = result.legacy;
-                const quotedCard = parseTweetCard(result.card);
-                if (quotedCard) tweet.quoted_status.card = quotedCard;
+                presentCard(tweet.quoted_status, result.card);
                 tweet.quoted_status.id = +tweet.quoted_status.id_str;
                 tweet.quoted_status.conversation_id = +tweet.quoted_status.conversation_id_str;
                 tweet.quoted_status.text = tweet.quoted_status.full_text;
@@ -544,8 +618,7 @@ function parseTweet(res) {
                 }
             }
         }
-        const card = parseTweetCard(res.card);
-        if (card) tweet.card = card;
+        presentCard(tweet, res.card);
         if (res.views) {
             if (!tweet.ext) tweet.ext = {};
             tweet.ext.views = { r: { ok: { count: +res.views.count } } };
@@ -1190,16 +1263,10 @@ const proxyRoutes = [
             for (let e of entries) {
                 // thats a lot of trash https://lune.dimden.dev/0bf524e52eb.png
                 if (e.entryId.startsWith("tweet-")) {
+                    if (isPromoted(e)) continue;
                     let res = e.content.itemContent.tweet_results.result;
                     let tweet = safeParseTweet(res);
-                    if (!tweet) continue;
-                    if (
-                        tweet.source &&
-                        (tweet.source.includes("Twitter for Advertisers") ||
-                            tweet.source.includes("advertiser-interface"))
-                    )
-                        continue;
-                    if (tweet.user.blocking || tweet.user.muting) continue;
+                    if (!tweet || tweetHidden(tweet)) continue;
 
                     tweets.push(tweet);
                 } else if (e.entryId.startsWith("home-conversation-")) {
@@ -1210,18 +1277,11 @@ const proxyRoutes = [
                         let item = items[i];
                         if (
                             (item.entryId.startsWith("tweet-") || item.entryId.includes("-tweet-")) &&
-                            !item.entryId.includes("promoted")
+                            !isPromoted(item)
                         ) {
                             let res = item.item.itemContent.tweet_results.result;
                             let tweet = safeParseTweet(res);
-                            if (!tweet) continue;
-                            if (
-                                tweet.source &&
-                                (tweet.source.includes("Twitter for Advertisers") ||
-                                    tweet.source.includes("advertiser-interface"))
-                            )
-                                continue;
-                            if (tweet.user.blocking || tweet.user.muting) break;
+                            if (!tweet || tweetHidden(tweet)) continue;
                             if (item.item.feedbackInfo) {
                                 tweet.feedback = item.item.feedbackInfo.feedbackKeys
                                     .map(
@@ -1367,6 +1427,7 @@ const proxyRoutes = [
             let threads = [];
             for (let e of list) {
                 if (e.entryId.startsWith("tweet-")) {
+                    if (isPromoted(e)) continue;
                     let res = e.content.itemContent.tweet_results.result;
                     let tweet = safeParseTweet(res);
                     if (tweet) {
@@ -1377,7 +1438,7 @@ const proxyRoutes = [
                     let thread = [];
                     for (let i = 0; i < lt.length; i++) {
                         let t = lt[i];
-                        if (t.entryId.startsWith("tweet-") || t.entryId.includes("-tweet-")) {
+                        if ((t.entryId.startsWith("tweet-") || t.entryId.includes("-tweet-")) && !isPromoted(t)) {
                             let res = t.item.itemContent.tweet_results.result;
                             let tweet = safeParseTweet(res);
                             if (!tweet) continue;
@@ -1388,7 +1449,7 @@ const proxyRoutes = [
                 }
             }
 
-            const visible = (t) => !t.user.muting && !t.user.blocking;
+            const visible = (t) => !tweetHidden(t);
             tweets = tweets.filter(visible);
             threads = threads.map((thread) => thread.filter(visible)).filter((thread) => thread.length);
             tweets.push(...threadTweetsInRange(tweets, threads, xhr.storage.since_id));
@@ -1789,7 +1850,7 @@ const proxyRoutes = [
                                             const user = go.users[userId];
                                             const tweet = notificationTweet(go, tweetId);
                                             const action = type === "users_retweeted_your_tweet" || type === "users_retweeted_your_retweet" ? "retweet" : "favorite";
-                                            if(!tweet || !user) continue;
+                                            if(!tweet || !user || userHidden(user)) continue;
                                             const id = legacyNotificationId(action, userId, tweetId);
                                             if(!shouldDeliver(id)) continue;
                                             const notifSortIndex = stableNotificationPosition(id, +sortIndex - (i++));
@@ -1818,7 +1879,7 @@ const proxyRoutes = [
                                 case "user_quoted_your_tweet":{
                                     const tweetId = item.content.tweet.id;
                                     const tweet = notificationTweet(go, tweetId);
-                                    if(!tweet) continue;
+                                    if(!tweet || tweetHidden(tweet)) continue;
                                     const type = item.clientEventInfo.element === "user_mentioned_you" ? "mention" : item.clientEventInfo.element === "user_replied_to_your_tweet" ? "reply" : "quote";
                                     
                                     const id = legacyNotificationId(type, tweet.user_id_str, tweetId);
@@ -1845,7 +1906,7 @@ const proxyRoutes = [
                                     const users = nf.template.aggregateUserActionsV1.fromUsers.map(u => u.user.id);
                                     for(const userId of users) {
                                         const user = go.users[userId];
-                                        if(!user) continue;
+                                        if(!user || userHidden(user)) continue;
                                         // legacy builds this id from (source user, target user) and OTD hands it the same user for both
                                         const id = legacyNotificationId("follow", userId, userId);
                                         if(!shouldDeliver(id)) continue;
@@ -1952,7 +2013,7 @@ const proxyRoutes = [
                             case "user_replied_to_your_tweet": 
                             case "user_quoted_your_tweet":{
                                 const tweet = notificationTweet(go, item.content.tweet.id);
-                                if(!tweet) continue;
+                                if(!tweet || tweetHidden(tweet)) continue;
                                 tweets.push(tweet);
                                 break;
                             }
@@ -2205,11 +2266,11 @@ const proxyRoutes = [
                 if (entry.entryId.startsWith("sq-I-t-") || entry.entryId.startsWith("tweet-")) {
                     let result = entry.content.itemContent.tweet_results.result;
 
-                    if (entry.content.itemContent.promotedMetadata) {
+                    if (isPromoted(entry)) {
                         continue;
                     }
                     let tweet = safeParseTweet(result);
-                    if (!tweet) {
+                    if (!tweet || tweetHidden(tweet)) {
                         continue;
                     }
                     res.push(tweet);
@@ -2592,7 +2653,7 @@ const proxyRoutes = [
                 .entries.find((e) => e.entryId === `tweet-${xhr.storage.tweet_id}`)
                 .content.itemContent;
             let res = ic.tweet_results.result;
-            let tweet = parseTweet(res);
+            let tweet = parseTweet(res, { expandNotes: true });
             return tweet;
         },
     },
@@ -2664,7 +2725,7 @@ const proxyRoutes = [
                 .entries.find((e) => e.entryId === `tweet-${xhr.storage.tweet_id}`)
                 .content.itemContent;
             let res = ic.tweet_results.result;
-            let tweet = parseTweet(res);
+            let tweet = parseTweet(res, { expandNotes: true });
             return tweet;
         },
     },
@@ -2803,10 +2864,25 @@ const proxyRoutes = [
                 if (!user.verified) user.verified = false;
             }
 
+            const hiddenTweetIds = new Set();
+            for (const id in data.globalObjects.tweets) {
+                const tweet = data.globalObjects.tweets[id];
+                const author = data.globalObjects.users?.[tweet.user_id_str];
+                const retweeted = tweet.retweeted_status && data.globalObjects.users?.[tweet.retweeted_status.user_id_str];
+                if (userHidden(author) || userHidden(retweeted)) hiddenTweetIds.add(id);
+                const quoted = tweet.quoted_status;
+                const quotedUser = quoted && (data.globalObjects.users?.[quoted.user_id_str] || quoted.user);
+                if (userHidden(quotedUser)) {
+                    delete tweet.quoted_status;
+                    tweet.is_quote_status = false;
+                }
+            }
+            for (const id of hiddenTweetIds) delete data.globalObjects.tweets[id];
+
             let entries = data.timeline.instructions.find((i) => i.addEntries);
             if (entries) {
                 entries.addEntries.entries = entries.addEntries.entries.filter(
-                    (e) => !e.entryId.startsWith("tweetComposer-")
+                    (e) => !e.entryId.startsWith("tweetComposer-") && !hiddenTweetIds.has(e.entryId.replace(/^tweet-/, ""))
                 );
                 for (let entry of entries.addEntries.entries) {
                     if (entry.entryId.startsWith("conversationThread-")) {
@@ -2822,6 +2898,8 @@ const proxyRoutes = [
                         if (entry.content.timelineModule.items)
                             for (let item of entry.content.timelineModule.items) {
                                 if (item.item && item.item.content && item.item.content.tweet) {
+                                    const tweetId = String(item.item.content.tweet.id_str || item.item.content.tweet.id || "");
+                                    if (hiddenTweetIds.has(tweetId)) continue;
                                     newContent.item.content.conversationThread.conversationComponents.push(
                                         {
                                             conversationTweetComponent: {

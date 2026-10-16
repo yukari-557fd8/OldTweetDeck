@@ -144,6 +144,17 @@ class FakeXHR {
     abort() {}
 }
 
+test('a notification from a muted account is skipped and the rest of the page is kept', () => {
+    const route = loadRoute();
+    const muted = user('8');
+    muted.muting = true;
+    const page = responseText([
+        single('user_replied_to_your_tweet', 'n2', 900, '101'),
+        aggregate('users_liked_your_tweet', 'n1', 1000, ['8'], ['100']),
+    ], { tweets: [tweet('101', '7'), tweet('100', '42')], users: [user('7'), muted, user('42')] });
+    assert.deepEqual(deliver(route, page).map(summary), ['reply:7:101@900']);
+});
+
 test('a challenge solver failure finishes as 503 without sending', async () => {
     const context = vm.createContext({
         localStorage: { twitterAccountID: '42' }, location: { hostname: 'x.com' },

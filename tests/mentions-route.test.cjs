@@ -104,6 +104,21 @@ test('a mention without its author is skipped, and a missing quote does not empt
     assert.equal(tweets[1].quoted_status, undefined);
 });
 
+test('a mention from a muted or blocked account is skipped', () => {
+    const route = loadRoute();
+    const muted = user('8');
+    muted.muting = true;
+    const page = allJsonPage([
+        single('user_replied_to_your_tweet', 'n2', 900, '101'),
+        single('user_mentioned_you', 'n4', 800, '102'),
+    ], {
+        tweets: [tweet('101', '7'), tweet('102', '8')],
+        users: [user('7'), muted],
+    });
+    const tweets = Array.from(route.afterRequest({ storage: { user_id: '42' }, responseText: page }));
+    assert.deepEqual(tweets.map(t => t.id_str), ['101']);
+});
+
 test('rate-limit headers are halved for the shared all.json quota and left alone when absent', () => {
     const override = loadRoute().responseHeaderOverride;
     assert.equal(override['x-rate-limit-limit']('180'), 90);

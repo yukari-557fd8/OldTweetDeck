@@ -12,7 +12,7 @@ function loadRoutes() {
     });
     vm.runInContext(source, context);
     const routes = vm.runInContext('proxyRoutes', context);
-    return (path) => routes.find(r => r.path === path);
+    return (path) => routes.find(r => r.path === path || (path && path.source && r.path && r.path.source === path.source));
 }
 
 function author(id, screenName) {
@@ -58,4 +58,42 @@ test('user timeline without a bottom cursor does not throw', () => {
     const data = { data: { user: { result: { timeline_v2: { timeline: { instructions: [{ type: 'TimelineAddEntries', entries }] } } } } } };
     const tweets = route.afterRequest({ storage: { user_id: '7' }, responseText: JSON.stringify(data) });
     assert.deepEqual(Array.from(tweets, t => t.id_str), ['1']);
+});
+
+test('search drops a muted author and a promoted entry', () => {
+    const route = loadRoutes()('/1.1/search/universal.json');
+    const muted = author('8', 'muted');
+    muted.relationship_perspectives = { blocking: true };
+    const promoted = entry('2', tweetResult('2', author('9', 'ada'), 'ad'));
+    promoted.content.itemContent.promotedMetadata = {};
+    const data = { data: { search_by_raw_query: { search_timeline: { timeline: { instructions: [{ entries: [
+        entry('1', tweetResult('1', author('7', 'ok'), 'visible')),
+        entry('3', tweetResult('3', muted, 'hidden')),
+        promoted,
+    ] }] } } } } };
+    const body = route.afterRequest({ storage: {}, responseText: JSON.stringify(data) });
+    assert.deepEqual(Array.from(body.modules, m => m.status.data.id_str), ['1']);
+});
+
+test('a conversation drops replies from a muted account', () => {
+    const route = loadRoutes()(/\/2\/timeline\/conversation\/(\d+).json/);
+    const data = {
+        globalObjects: {
+            users: { '7': { id_str: '7', muting: true, entities: {} }, '8': { id_str: '8', entities: {} } },
+            tweets: {
+                '1': { id_str: '1', user_id_str: '8', full_text: 'root' },
+                '2': { id_str: '2', user_id_str: '7', full_text: 'muted reply' },
+            },
+        },
+        timeline: { instructions: [{ addEntries: { entries: [
+            { entryId: 'conversationThread-1', content: { timelineModule: { items: [
+                { item: { content: { tweet: { id: '1' } } } },
+                { item: { content: { tweet: { id: '2' } } } },
+            ] } } },
+        ] } }] },
+    };
+    const body = route.afterRequest({ responseText: JSON.stringify(data) });
+    assert.equal(body.globalObjects.tweets['2'], undefined);
+    const items = body.timeline.instructions[0].addEntries.entries[0].content.item.content.conversationThread.conversationComponents;
+    assert.deepEqual(Array.from(items, item => String(item.conversationTweetComponent.tweet.id)), ['1']);
 });

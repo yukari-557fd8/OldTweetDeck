@@ -113,12 +113,27 @@ test('a poll keeps a new reply but not the older tweets of its conversation', ()
     assert.deepEqual(Array.from(polled, t => t.id_str), ['60', '55']);
 });
 
+test('an organic Twitter for Advertisers post stays and a promoted entry does not', () => {
+    const ctx = load();
+    const home = route(ctx, HOME);
+    const promoted = entry('16');
+    promoted.content.itemContent.promotedMetadata = { advertiser_results: {} };
+    const tweets = home.afterRequest({ storage: { user_id: '42' }, responseText: page([
+        entry('15', { source: '<a href="https://ads.x.com">Twitter for Advertisers</a>' }),
+        promoted,
+        cursor('bottom', 'BOT'),
+    ]) });
+    assert.deepEqual(Array.from(tweets, t => t.id_str), ['15']);
+});
+
 test('a page where nothing survives the filters moves the bound one page deeper', () => {
     const ctx = load();
     const home = route(ctx, HOME);
     home.afterRequest({ storage: { user_id: '42' }, responseText: page([entry('30'), entry('20'), cursor('bottom', 'BOT1')]) });
+    const muted = tweetResult('15');
+    muted.core.user_results.result.relationship_perspectives = { muting: true };
     const nothing = home.afterRequest({ storage: { user_id: '42', requested_id: '20' }, responseText: page([
-        entry('15', { source: '<a href="https://ads.x.com">Twitter for Advertisers</a>' }), cursor('bottom', 'BOT2'),
+        { entryId: 'tweet-15', content: { itemContent: { tweet_results: { result: muted } } } }, cursor('bottom', 'BOT2'),
     ]) });
     assert.deepEqual(Array.from(nothing), []);
     assert.equal(vm.runInContext('timelineCursor', ctx)('home-42', '20', 'bottom'), 'BOT2');
