@@ -1630,6 +1630,13 @@ const proxyRoutes = [
     {
         path: "/1.1/statuses/mentions_timeline.json",
         method: "GET",
+        // This reads the same all.json page as the Notifications column (see beforeRequest), so let
+        // legacy's scheduler see only half of the shared quota here and keep both columns' polling
+        // inside the one rate limit.
+        responseHeaderOverride: {
+            "x-rate-limit-limit": (value) => value == null ? value : Math.floor(+value / 2),
+            "x-rate-limit-remaining": (value) => value == null ? value : Math.floor(+value / 2),
+        },
         beforeRequest: (xhr) => {
             const params = new URLSearchParams(xhr.modUrl);
             const since_id = params.get("since_id");
@@ -1643,7 +1650,10 @@ const proxyRoutes = [
                 cursor = cursors[`mentions-${user_id}-bottom`];
             }
 
-            xhr.modUrl = `https://${location.hostname}/i/api/2/notifications/mentions.json?include_profile_interstitial_type=1&include_blocking=1&include_blocked_by=1&include_followed_by=1&include_want_retweets=1&include_mute_edge=1&include_can_dm=1&include_can_media_tag=1&include_ext_has_nft_avatar=1&include_ext_is_blue_verified=1&include_ext_verified_type=1&include_ext_profile_image_shape=1&skip_status=1&cards_platform=Web-12&include_cards=1&include_ext_alt_text=true&include_ext_limited_action_results=true&include_quote_count=true&include_reply_count=1&tweet_mode=extended&include_ext_views=true&include_entities=true&include_user_entities=true&include_ext_media_color=true&include_ext_media_availability=true&include_ext_sensitive_media_warning=true&include_ext_trusted_friends_metadata=true&send_error_codes=true&simple_quoted_tweet=true&count=20&requestContext=launch&ext=mediaStats%2ChighlightedLabel%2ChasNftAvatar%2CvoiceInfo%2CbirdwatchPivot%2CsuperFollowMetadata%2CunmentionInfo%2CeditControl${cursor ? `&cursor=${cursor}` : ''}`;
+            // X's mentions.json lags the "all" notifications timeline by half an hour or more and does
+            // not catch up while being polled, so fetch the all.json page instead and keep only the
+            // mention / reply / quote entries below (the cursors stay under their own `mentions-` keys).
+            xhr.modUrl = `https://${location.hostname}/i/api/2/notifications/all.json?include_profile_interstitial_type=1&include_blocking=1&include_blocked_by=1&include_followed_by=1&include_want_retweets=1&include_mute_edge=1&include_can_dm=1&include_can_media_tag=1&include_ext_has_nft_avatar=1&include_ext_is_blue_verified=1&include_ext_verified_type=1&include_ext_profile_image_shape=1&skip_status=1&cards_platform=Web-12&include_cards=1&include_ext_alt_text=true&include_ext_limited_action_results=true&include_quote_count=true&include_reply_count=1&tweet_mode=extended&include_ext_views=true&include_entities=true&include_user_entities=true&include_ext_media_color=true&include_ext_media_availability=true&include_ext_sensitive_media_warning=true&include_ext_trusted_friends_metadata=true&send_error_codes=true&simple_quoted_tweet=true&count=20&requestContext=launch&ext=mediaStats%2ChighlightedLabel%2ChasNftAvatar%2CvoiceInfo%2CbirdwatchPivot%2CsuperFollowMetadata%2CunmentionInfo%2CeditControl${cursor ? `&cursor=${cursor}` : ''}`;
         },
         beforeSendHeaders: (xhr) => {
             xhr.modReqHeaders["Content-Type"] = "application/json";
