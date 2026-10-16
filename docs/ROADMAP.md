@@ -36,7 +36,7 @@
 
 - Proxy に `beforeSend` フックを追加(`send()` 冒頭、ヘッダ確定後)。Home / notifications / mentions は `open()` を `beforeSend` まで保留し、`x-act-as-user-id` からユーザー ID を解決してから cursor 付き URL で開く(1-a)。
 - Proxy の `get` トラップに `inspectResponse` を追加。legacy が `status` を読む瞬間に一度だけ応答を検査し、GraphQL エラーだけの 200 を 503 に変える(1-d)。
-- ページ台帳 `timelinePages`(feed ごとに `{ids, bottom, top}`)を導入。ページ内の全 ID から cursor を引ける。会話モジュールは `keepThreadTogether` で返信の直上に並ぶ sort key(`receiveTime`)を持つ(1-b)。Home / List / User に適用。
+- ページ台帳 `timelinePages`(feed ごとに `{ids, bottom, top}`)を導入。ページ内の全 ID から cursor を引ける。会話モジュールは最新のツイート(返信)を残し、それより古いツイートはページの範囲内(新着取得では前回より新しいもの)だけを自身の ID の位置に残す(`threadTweetsInRange`、1-b)。Home / List / User に適用。92f0be5 では `receiveTime` で返信の直上に並べていたが、古いツイートが時系列を外れて表示されるため変更した。
 - cursor が無い `max_id` 要求はネットワークに出さず 503 で即応答(1-c)。全件フィルタで空になったページは次の cursor に進める。
 - `TD.controller.FeedPoller` をラップし `EXHAUSTED_API_THRESHOLD` を 1 に、refresh のたびに `intervalOfPossibility` を全域に戻す(1-d)。
 - since ポーリングは 10 分に 1 回 cursor 無しで先頭を取り直す(`TOP_RESYNC_INTERVAL`)。`seenHomeTweets` は上限 2000 の Set(1-e)。List / User の `max_id` 要求が refresh throttle でキャンセルされていた問題も解消。
@@ -97,7 +97,7 @@ upstream でも「Home の下端でスピナーが出続ける」「数時間前
 
 ### Phase 1 のテスト
 
-- 自動テスト(済み): `tests/home-scroll.test.cjs` に 7 件。連携アカウントの cursor を send 時に解決すること、会話モジュールの sort key と全 ID からの cursor 引き当て、全件フィルタで空のページは次へ進むこと、GraphQL エラーだけの 200 を失敗(503)として返すこと、since ポーリングの cursor と 10 分ごとの再同期、FeedPoller が短いページで止まらないこと、List の同等処理と未知の bound での即時失敗。`tests/mentions-route.test.cjs` は send 時の cursor 選択に合わせて更新。
+- 自動テスト(済み): `tests/home-scroll.test.cjs` に 8 件。連携アカウントの cursor を send 時に解決すること、会話モジュールの古いツイートの扱い(ページ内と新着取得)と全 ID からの cursor 引き当て、全件フィルタで空のページは次へ進むこと、GraphQL エラーだけの 200 を失敗(503)として返すこと、since ポーリングの cursor と 10 分ごとの再同期、FeedPoller が短いページで止まらないこと、List の同等処理と未知の bound での即時失敗。`tests/mentions-route.test.cjs` は send 時の cursor 選択に合わせて更新。
 - 実機(未実施): 連携アカウントの Home と、会話モジュールを含むページで下端までスクロールして追加取得されること。DevTools の Network で同じ cursor の連続要求が無いこと。
 
 ---

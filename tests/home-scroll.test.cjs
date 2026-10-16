@@ -87,19 +87,30 @@ test('a Teams account resolves its own Home cursors at send time', async () => {
     assert.equal(other.loaded.text, '[]');
 });
 
-test('a conversation module keeps its thread at the reply and any of its ids finds the page', () => {
+test('a conversation module keeps older tweets only where the page reaches, in time order, and any id finds the page', () => {
     const ctx = load();
     const tweets = route(ctx, HOME).afterRequest({ storage: { user_id: '42' }, responseText: page([
-        entry('50'), conversation(['10', '40']), entry('30'), cursor('top', 'TOP'), cursor('bottom', 'BOT'),
+        entry('50'), conversation(['10', '40']), conversation(['35', '45']), entry('30'), cursor('top', 'TOP'), cursor('bottom', 'BOT'),
     ]) });
-    assert.deepEqual(Array.from(tweets, t => t.id_str), ['50', '10', '40', '30']);
-    assert.equal(tweets[1].receiveTime, '41');     // the parent sorts just above its reply instead of at its own, much older, id
-    assert.equal(tweets[2].receiveTime, undefined);
+    // 10 is older than anything else on the page: at its own id it would become the bottom chirp,
+    // next to its reply it would be an old tweet out of order, so it is left out
+    assert.deepEqual(Array.from(tweets, t => t.id_str), ['50', '45', '40', '35', '30']);
+    assert.ok(tweets.every(t => t.receiveTime === undefined));
     const timelineCursor = vm.runInContext('timelineCursor', ctx);
-    for (const id of ['50', '10', '40', '30']) {
+    for (const id of ['50', '45', '40', '35', '30']) {
         assert.equal(timelineCursor('home-42', id, 'bottom'), 'BOT');
         assert.equal(timelineCursor('home-42', id, 'top'), 'TOP');
     }
+});
+
+test('a poll keeps a new reply but not the older tweets of its conversation', () => {
+    const ctx = load();
+    const home = route(ctx, HOME);
+    home.afterRequest({ storage: { user_id: '42' }, responseText: page([entry('50'), entry('30'), cursor('top', 'TOP1')]) });
+    const polled = home.afterRequest({ storage: { user_id: '42', since_id: '50' }, responseText: page([
+        conversation(['20', '45', '60']), entry('55'), cursor('top', 'TOP2'),
+    ]) });
+    assert.deepEqual(Array.from(polled, t => t.id_str), ['60', '55']);
 });
 
 test('a page where nothing survives the filters moves the bound one page deeper', () => {
@@ -155,7 +166,7 @@ test('legacy FeedPoller stops treating a short page as the end of the feed', () 
     assert.equal(TD.controller.FeedPoller, Patched);
 });
 
-test('list timelines keep threads together, map every id to the page and fail fast on an unknown bound', () => {
+test('list timelines drop conversation tweets older than the page, map every id to the page and fail fast on an unknown bound', () => {
     const ctx = load();
     const list = route(ctx, '/1.1/lists/statuses.json');
     const listPage = JSON.stringify({ data: { list: { tweets_timeline: { timeline: { instructions: [{ type: 'TimelineAddEntries', entries: [
@@ -164,12 +175,11 @@ test('list timelines keep threads together, map every id to the page and fail fa
         entry('30'), cursor('bottom', 'LBOT'),
     ] }] } } } } });
     const tweets = list.afterRequest({ storage: { list_id: '77' }, responseText: listPage });
-    assert.deepEqual(Array.from(tweets, t => t.id_str), ['10', '40', '30']);
-    assert.equal(tweets[0].receiveTime, '41');
-    assert.equal(vm.runInContext('timelineCursor', ctx)('list-77', '10', 'bottom'), 'LBOT');
+    assert.deepEqual(Array.from(tweets, t => t.id_str), ['40', '30']);
+    assert.equal(vm.runInContext('timelineCursor', ctx)('list-77', '40', 'bottom'), 'LBOT');
 
     const request = (query) => ({ modUrl: 'https://api.x.com/1.1/lists/statuses.json?' + query, storage: {}, modReqHeaders: {}, open() { this.opened = true; } });
-    const known = request('list_id=77&max_id=9');
+    const known = request('list_id=77&max_id=29');
     list.beforeRequest(known); list.openHandler(known, 'GET', known.modUrl, true);
     assert.equal(known.opened, true);
     assert.equal(JSON.parse(new URL(known.modUrl).searchParams.get('variables')).cursor, 'LBOT');

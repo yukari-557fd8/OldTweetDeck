@@ -712,19 +712,31 @@ function findCursor(entries, edge) {
 }
 
 // Legacy sorts a column by `receiveTime || id` (TwitterStatus.fromJSONObject in bundle.js). A
-// conversation module carries the older tweets a reply answers; by id those sink far below the
-// reply and can become the column's bottom chirp, the one legacy turns into max_id for infinite
-// scroll, after which every page below is discarded as "too new". Keep the thread together: the
-// newest tweet keeps its id as sort key and each older one sorts just above it, in thread order.
-function keepThreadTogether(thread) {
-    if (thread.length < 2) return thread;
-    const oldestFirst = [...thread].sort((a, b) => compareIds(a.id_str, b.id_str));
-    const newest = BigInt(oldestFirst[oldestFirst.length - 1].id_str);
-    oldestFirst.forEach((tweet, i) => {
-        const above = BigInt(oldestFirst.length - 1 - i);
-        if (above > 0n) tweet.receiveTime = String(newest + above);
+// conversation module carries the older tweets a reply answers. At their own ids those can sink
+// below the page and become the column's bottom chirp, the one legacy turns into max_id for infinite
+// scroll, after which every page below is discarded as "too new"; sorted up to the reply instead,
+// they show old tweets out of order. So keep each module's newest tweet, and an older one only where
+// the page itself reaches back that far and, for a poll, only past what the column already has.
+function threadTweetsInRange(standalone, threads, since_id) {
+    if (!threads.length) return [];
+    const heads = threads.map(newestTweet);
+    let floor;
+    for (const tweet of [...standalone, ...heads]) {
+        const id = BigInt(tweet.id_str);
+        if (floor === undefined || id < floor) floor = id;
+    }
+    if (since_id && BigInt(since_id) >= floor) floor = BigInt(since_id) + 1n;
+    const kept = [];
+    threads.forEach((thread, i) => {
+        for (const tweet of thread) {
+            if (tweet === heads[i] || BigInt(tweet.id_str) >= floor) kept.push(tweet);
+        }
     });
-    return oldestFirst;
+    return kept;
+}
+
+function newestTweet(thread) {
+    return thread.reduce((a, b) => (compareIds(b.id_str, a.id_str) > 0 ? b : a));
 }
 
 function compareIds(a, b) {
@@ -733,7 +745,7 @@ function compareIds(a, b) {
 }
 
 function sortNewestFirst(tweets) {
-    return tweets.sort((a, b) => compareIds(b.receiveTime ?? b.id_str, a.receiveTime ?? a.id_str));
+    return tweets.sort((a, b) => compareIds(b.id_str, a.id_str));
 }
 
 // true when `id` is new for this account's Home feed; the set stays bounded.
@@ -1143,6 +1155,7 @@ const proxyRoutes = [
             const user_id = xhr.storage.user_id;
             const feedKey = `home-${user_id}`;
             let tweets = [];
+            let threads = [];
             for (let e of entries) {
                 // thats a lot of trash https://lune.dimden.dev/0bf524e52eb.png
                 if (e.entryId.startsWith("tweet-")) {
@@ -1195,12 +1208,13 @@ const proxyRoutes = [
                             thread.push(tweet);
                         }
                     }
-                    for (let tweet of keepThreadTogether(thread)) {
-                        // a poll re-sends the context of a thread the column already shows
-                        if (xhr.storage.since_id && !rememberHomeTweet(user_id, tweet.id_str)) continue;
-                        tweets.push(tweet);
-                    }
+                    if (thread.length) threads.push(thread);
                 }
+            }
+            for (let tweet of threadTweetsInRange(tweets, threads, xhr.storage.since_id)) {
+                // a poll can re-send a thread the column already shows
+                if (xhr.storage.since_id && !rememberHomeTweet(user_id, tweet.id_str)) continue;
+                tweets.push(tweet);
             }
 
             const bottomCursor = findCursor(entries, "bottom");
@@ -1241,6 +1255,7 @@ const proxyRoutes = [
                 let since_id = params.get("since_id");
                 const feedKey = `list-${list_id}`;
                 xhr.storage.max_id = max_id;
+                xhr.storage.since_id = since_id;
                 if (max_id) {
                     const requested = String(BigInt(max_id) + 1n);
                     const cursor = timelineCursor(feedKey, requested, "bottom");
@@ -1318,6 +1333,7 @@ const proxyRoutes = [
             if (!list) return [];
             list = list.entries;
             let tweets = [];
+            let threads = [];
             for (let e of list) {
                 if (e.entryId.startsWith("tweet-")) {
                     let res = e.content.itemContent.tweet_results.result;
@@ -1337,11 +1353,14 @@ const proxyRoutes = [
                             thread.push(tweet);
                         }
                     }
-                    tweets.push(...keepThreadTogether(thread));
+                    if (thread.length) threads.push(thread);
                 }
             }
 
-            tweets = tweets.filter(t => !t.user.muting && !t.user.blocking);
+            const visible = (t) => !t.user.muting && !t.user.blocking;
+            tweets = tweets.filter(visible);
+            threads = threads.map((thread) => thread.filter(visible)).filter((thread) => thread.length);
+            tweets.push(...threadTweetsInRange(tweets, threads, xhr.storage.since_id));
 
             const feedKey = `list-${xhr.storage.list_id}`;
             const bottomCursor = findCursor(list, "bottom");
@@ -1406,6 +1425,7 @@ const proxyRoutes = [
                 let max_id = params.get("max_id");
                 const feedKey = `user-${variables.userId}`;
                 xhr.storage.max_id = max_id;
+                xhr.storage.since_id = since_id;
                 if (max_id) {
                     const requested = String(BigInt(max_id) + 1n);
                     const cursor = timelineCursor(feedKey, requested, "bottom");
@@ -1486,6 +1506,7 @@ const proxyRoutes = [
             }
             entries = entries.entries;
             let tweets = [];
+            let threads = [];
             for (let entry of entries) {
                 if (entry.entryId.startsWith("tweet-")) {
                     let result = entry.content.itemContent.tweet_results.result;
@@ -1506,9 +1527,10 @@ const proxyRoutes = [
                             }
                         }
                     }
-                    tweets.push(...keepThreadTogether(thread));
+                    if (thread.length) threads.push(thread);
                 }
             }
+            tweets.push(...threadTweetsInRange(tweets, threads, xhr.storage.since_id));
 
             const feedKey = `user-${xhr.storage.user_id}`;
             const bottomCursor = findCursor(entries, "bottom");
