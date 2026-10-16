@@ -971,7 +971,7 @@ document.body.addEventListener("click", function (e) {
                 w = /\B(?=(\d{3})+(?!\d))/g,
                 b = /^[@\uff20]?/,
                 y =
-                    /^https?:\/\/twitter\.com\/([a-zA-Z0-9_-]+)(?:(?:\/status(?:es)?\/([0-9]+))?|(?:(\/(?:lists|timelines)\/)|\/)?([a-zA-Z0-9_-]+))\/?(\?.*)?$/,
+                    /^https?:\/\/(?:(?:www|mobile)\.)?(?:twitter|x)\.com\/([a-zA-Z0-9_-]+)(?:(?:\/status(?:es)?\/([0-9]+))?|(?:(\/(?:lists|timelines)\/)|\/)?([a-zA-Z0-9_-]+))\/?(\?.*)?$/,
                 _ = [
                     "404",
                     "500",
@@ -983,7 +983,7 @@ document.body.addEventListener("click", function (e) {
                     "search",
                     "search-advanced",
                     "search-home",
-                    "tos",
+                    "tos", "home", "explore", "notifications", "messages", "settings", "compose", "i",
                 ],
                 C = !isNaN(new Date("Mon Oct 08 16:34:01 +0000 2012").getTime());
             m.default.hasOwnProperty("subscribe") &&
@@ -1236,7 +1236,7 @@ document.body.addEventListener("click", function (e) {
                     l &&
                         ((s = l[1]), (r = l[2]), l[3] && (a = l[3].replace(/\//g, "")), (o = l[4]));
                     var c = s && o && !(r || a);
-                    (-1 !== _.indexOf(s) || c) &&
+                    ((-1 !== _.indexOf(s) && !r) || c) &&
                         ((s = void 0), (o = void 0), (r = void 0), (a = void 0)),
                         (0, u.default)(i, "https://") ||
                             (0, u.default)(i, "http://") ||

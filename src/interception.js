@@ -826,8 +826,207 @@ function graphqlPageInspector(timelineOf) {
             console.warn("OldTweetDeck: GraphQL error page", data?.errors ?? data);
             xhr._status = 503;
             xhr._statusText = "GraphQL error";
+            xhr.storage.failure = { kind: "x-error", status: null, detail: data?.errors?.[0]?.message || "GraphQL error" };
         }
     };
+}
+
+// ---- telling the user why requests fail -------------------------------------------------------
+
+// Legacy shows nothing when a column's request fails. At startup it shows "Error initializing
+// TweetDeck" or a bare login form, and a request that never finishes leaves the spinner up for
+// good. Remember why requests failed. Before TweetDeck is ready, put that on the login form or
+// the loading screen. After that, raise a toast, at most once per reason and column type.
+const REQUEST_LABELS = {
+    "/1.1/account/verify_credentials.json": "account verification",
+    "/1.1/users/contributees.json": "linked accounts",
+    "/1.1/tweetdeck/clients/blackbird/all": "your saved columns",
+    "/1.1/statuses/home_timeline.json": "Home",
+    "/1.1/lists/statuses.json": "List columns",
+    "/1.1/statuses/user_timeline.json": "User columns",
+    "/1.1/statuses/bookmarks.json": "Bookmarks",
+    "/1.1/activity/about_me.json": "Notifications",
+    "/1.1/statuses/mentions_timeline.json": "Mentions",
+    "/1.1/favorites/list.json": "Likes",
+    "/1.1/search/universal.json": "Search",
+};
+// 401 and 403 stay off the toasts: after startup they also answer protected or missing accounts.
+const TOASTED_FAILURES = new Set(["rate-limit", "x-error", "solver", "unreadable"]);
+const FAILURE_NOTICE_INTERVAL = 5 * 60 * 1000;
+const STARTUP_STALL_DELAY = 30 * 1000;
+const startupFailures = [];
+const startupRequests = [];
+const failureNoticeUntil = new Map();
+let loginMessagePatched = false;
+let startupWatch = null;
+
+function legacyReady() {
+    return typeof TD !== "undefined" && TD.ready === true;
+}
+
+function requestLabel(path) {
+    if (REQUEST_LABELS[path]) return REQUEST_LABELS[path];
+    if (/^\/2\/timeline\/conversation\//.test(path)) return "a conversation";
+    return null;
+}
+
+function requestPath(xhr) {
+    try {
+        return new URL(xhr.originalUrl || xhr.modUrl).pathname;
+    } catch (e) {
+        return "";
+    }
+}
+
+function formatClock(time) {
+    return new Date(time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function describeFailure(f) {
+    switch (f.kind) {
+        case "rate-limit":
+            return `X is rate limiting ${f.label} (429). ` + (f.resetAt
+                ? `It should work again after ${formatClock(f.resetAt)}.`
+                : "Wait a few minutes before reloading.");
+        case "session":
+            return `X refused ${f.label} (${f.status}). Check that you are logged in at x.com, then reload TweetDeck.`;
+        case "solver":
+            return `Could not sign the request for ${f.label} (${f.detail}). Reload TweetDeck. If this keeps happening, the challenge solver may need an update.`;
+        case "unreadable":
+            return `X sent a response for ${f.label} that OldTweetDeck could not read.`;
+        case "network":
+            return `Could not reach X for ${f.label}. Check your connection, then reload TweetDeck.`;
+        case "verification-timeout":
+            return "X did not confirm your account within 20 seconds. Reload TweetDeck.";
+        default: {
+            const detail = [f.status, f.detail].filter(Boolean).join(": ");
+            return `X returned an error for ${f.label}${detail ? ` (${detail})` : ""}.`;
+        }
+    }
+}
+
+// A finished request's status as legacy sees it, or nothing when it worked. A request this file
+// answered itself (no cursor yet, and so on) is not a problem unless it says why it failed.
+function failureFromStatus(xhr) {
+    const status = xhr._status || xhr.status;
+    if ((status >= 200 && status < 300) || status === 304) return null;
+    if (xhr.storage?.failure) return Object.assign({ status }, xhr.storage.failure);
+    if (xhr.storage?.cancelled) return null;
+    if (status === 429) {
+        const reset = Number(xhr.getResponseHeader?.("x-rate-limit-reset"));
+        return { kind: "rate-limit", status, resetAt: reset > 0 ? reset * 1000 : null };
+    }
+    if (status === 401 || status === 403) return { kind: "session", status };
+    if (status === 0) return { kind: "network", status };
+    // 400 and 404 on a timeline usually mean X retired the GraphQL query id it uses.
+    if (status >= 500 || status === 400 || status === 404) return { kind: "x-error", status, detail: xhr.statusText || "" };
+    return null;
+}
+
+// Only the requests in REQUEST_LABELS are reported: startup depends on the first three, and the
+// rest feed columns. Legacy reports failed actions such as a like or a reply itself.
+function noteRequestFailure(xhr, failure) {
+    if (!failure || xhr._failureNoted) return;
+    xhr._failureNoted = true;
+    const label = requestLabel(requestPath(xhr));
+    if (!label) return;
+    const notice = Object.assign({ label }, failure);
+    if (!legacyReady()) {
+        const same = startupFailures.findIndex((f) => f.kind === notice.kind && f.label === notice.label);
+        if (same >= 0) startupFailures.splice(same, 1);
+        startupFailures.push(notice);
+        if (startupFailures.length > 3) startupFailures.shift();
+        explainStartupFailures();
+        return;
+    }
+    const method = String(xhr.modMethod || "GET").toUpperCase();
+    if (method !== "GET" || !TOASTED_FAILURES.has(notice.kind)) return;
+    const key = `${notice.kind}:${notice.label}`;
+    const now = Date.now();
+    if (now < (failureNoticeUntil.get(key) ?? 0)) return;
+    failureNoticeUntil.set(key, Math.max(now + FAILURE_NOTICE_INTERVAL, notice.resetAt || 0));
+    try {
+        globalThis.toasts.showErrorNotification({ message: describeFailure(notice), timeoutDelayMs: 15000 });
+    } catch (e) {
+        console.warn("OldTweetDeck:", describeFailure(notice));
+    }
+}
+
+// Legacy ends a failed startup in TD.controller.init.showLogin(message), with a message that
+// does not say what failed, or none at all for 401 and 403.
+function explainStartupFailures() {
+    if (loginMessagePatched) return;
+    try {
+        const init = TD.controller.init;
+        const showLogin = init.showLogin;
+        if (typeof showLogin !== "function") return;
+        init.showLogin = function (message) {
+            const reasons = startupFailures.map(describeFailure).join(" ");
+            return showLogin.call(this, reasons ? `TweetDeck could not start. ${reasons}` : message);
+        };
+        loginMessagePatched = true;
+    } catch (e) {
+        // TD isn't loaded yet; the next failure tries again.
+    }
+}
+
+function rememberStartupRequest(xhr) {
+    if (legacyReady()) return;
+    startupRequests.push({ xhr, since: Date.now() });
+    if (startupRequests.length > 50) startupRequests.shift();
+}
+
+function startupStatusText(now = Date.now()) {
+    if (startupFailures.length) {
+        return `TweetDeck has not loaded. ${startupFailures.map(describeFailure).join(" ")}`;
+    }
+    const waiting = startupRequests.find(
+        (r) => !r.xhr.storage?.cancelled && r.xhr.readyState !== 4 && r.xhr._readyState !== 4
+    );
+    if (waiting) {
+        const path = requestPath(waiting.xhr);
+        const seconds = Math.round((now - waiting.since) / 1000);
+        return `TweetDeck is still waiting for X to answer ${requestLabel(path) || path} (${seconds} s).`;
+    }
+    return "TweetDeck is taking longer than usual to load.";
+}
+
+// Under the startup spinner, once it has been up for a while. The login form replaces the
+// spinner's container when startup fails, and carries its own message: then this returns false.
+function renderStartupStatus() {
+    const container = document.querySelector(".js-app-loading .js-signin-ui");
+    if (!container || !container.querySelector(".spinner-centered")) return false;
+    let line = container.querySelector(".otd-startup-status");
+    if (!line) {
+        line = document.createElement("p");
+        line.className = "otd-startup-status";
+        line.style.cssText = "margin: 16px auto 0; max-width: 420px; line-height: 1.5;";
+        container.appendChild(line);
+    }
+    line.textContent = startupStatusText() + " ";
+    const reload = document.createElement("a");
+    reload.href = "#";
+    reload.textContent = "Reload";
+    reload.addEventListener("click", (e) => {
+        e.preventDefault();
+        location.reload();
+    });
+    line.appendChild(reload);
+    return true;
+}
+
+function watchStartup() {
+    if (startupWatch || typeof document === "undefined") return;
+    startupWatch = setTimeout(function check() {
+        if (legacyReady()) return;
+        try {
+            if (!renderStartupStatus()) return;
+        } catch (e) {
+            console.error(e);
+            return;
+        }
+        startupWatch = setTimeout(check, 5000);
+    }, STARTUP_STALL_DELAY);
 }
 
 // ---- timeline pages and cursors ---------------------------------------------------------------
@@ -991,6 +1190,27 @@ function relaxLegacyExhaustion() {
     } catch (e) {
         // TD isn't loaded yet; the next state load tries again.
     }
+}
+
+// Legacy closes every desktop notification five seconds after it shows (TD.controller.notifications
+// in bundle.js). On Windows that takes it off the screen and out of the Action Center, whatever
+// the system's display time is (#381, #338). Its onshow handler does nothing else, so ignore it
+// and leave the notification to the OS. bundle.js reads window.Notification when it loads, after
+// this file.
+if (typeof Notification === "function") {
+    const NativeNotification = Notification;
+    Notification = class extends NativeNotification {
+        static get permission() {
+            return NativeNotification.permission;
+        }
+        static requestPermission(...args) {
+            return NativeNotification.requestPermission(...args);
+        }
+        get onshow() {
+            return null;
+        }
+        set onshow(handler) {}
+    };
 }
 
 function getCurrentUserId() {
@@ -3495,6 +3715,7 @@ const proxyRoutes = [
                 if (Date.now() >= deadline) {
                     // Complete the request as an error so TweetDeck can show its
                     // normal login error instead of leaving an unresolved spinner.
+                    if (xhr.storage) xhr.storage.failure = { kind: "verification-timeout" };
                     xhr._status = 503;
                     xhr._responseText = JSON.stringify({ errors: [{
                         message: "Account verification timed out. Please refresh TweetDeck.",
@@ -3729,6 +3950,8 @@ XMLHttpRequest = function () {
                     this._status = 503;
                 }
             }
+            rememberStartupRequest(this);
+            watchStartup();
             let parsedUrl = new URL(this.modUrl);
             let method = this.modMethod;
             if(!method) {
@@ -3761,6 +3984,7 @@ XMLHttpRequest = function () {
                         // timeout, so the column stays on "Loading…". Complete it as a failure.
                         console.error(`Challenge error for ${method} ${parsedUrl.pathname}:`, e);
                         failWithoutRequest(this, `challenge solver failed for ${method} ${parsedUrl.pathname}`);
+                        this.storage.failure = { kind: "solver", detail: String(e) };
                         emulateResponse(this);
                         return;
                     }
@@ -3803,6 +4027,14 @@ XMLHttpRequest = function () {
                     console.error(e);
                 }
             }
+            if (key === "status" && !xhr._failureChecked && (xhr.readyState === 4 || xhr._readyState === 4)) {
+                xhr._failureChecked = true;
+                try {
+                    noteRequestFailure(xhr, failureFromStatus(xhr));
+                } catch (e) {
+                    console.error(e);
+                }
+            }
             if (key === "responseText" && xhr._responseText) return xhr._responseText;
             if (key === "responseText") return this.interceptResponseText(xhr);
             if (key === "readyState" && xhr._readyState) return xhr._readyState;
@@ -3825,7 +4057,18 @@ XMLHttpRequest = function () {
         },
         interceptResponseText(xhr) {
             if (xhr.proxyRoute && xhr.proxyRoute.afterRequest) {
-                let out = xhr.proxyRoute.afterRequest(xhr);
+                let out;
+                try {
+                    out = xhr.proxyRoute.afterRequest(xhr);
+                } catch (e) {
+                    // jQuery reads responseText after detaching its handlers, so a throw here (a
+                    // 429 or an HTML error page that is not JSON) left the request unfinished for
+                    // good: the startup spinner, or "Loading…" in a column. A body that is not
+                    // JSON makes jQuery fail the request as a parse error instead.
+                    console.error(`OldTweetDeck: could not read the response for ${xhr.modUrl}`, e);
+                    noteRequestFailure(xhr, { kind: "unreadable", status: xhr._status || xhr.status });
+                    return "OldTweetDeck: unreadable response";
+                }
                 if (typeof out === "object") {
                     return JSON.stringify(out);
                 } else {

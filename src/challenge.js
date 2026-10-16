@@ -92,7 +92,17 @@ function solveChallenge(path, method) {
         let id = solveId++;
         solveCallbacks[id] = { resolve, reject, time: Date.now() };
         if(!solverIframe.contentWindow) {
+            let loaded = false;
+            // The iframe may never load (blocked, or #injected-body never shows up). Fail the
+            // request then too, or it is never sent and its column never stops loading.
+            setTimeout(() => {
+                if(!loaded && solveCallbacks[id]) {
+                    solveCallbacks[id].reject('Solver did not load');
+                    delete solveCallbacks[id];
+                }
+            }, 30000);
             solverIframe.addEventListener('load', () => {
+                loaded = true;
                 solverIframe.contentWindow.postMessage({ action: 'solve', id, path, method }, '*');
                 setTimeout(() => {
                     if(solveCallbacks[id]) {
