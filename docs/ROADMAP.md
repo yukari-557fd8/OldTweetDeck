@@ -1,9 +1,9 @@
 # 修正ロードマップ(upstream Issue 棚卸し: 2026-10-17 時点)
 
 対象: [dimdenGD/OldTweetDeck](https://github.com/dimdenGD/OldTweetDeck) の open Issue 67 件(2026-10-17 に `gh issue list` で取得)。67 件すべてを下のいずれかの節に分類している。
-本フォークは upstream `main`(8bcb4bb)+ 17 コミット(582c857 時点)。
+本フォークは upstream `main`(8bcb4bb)+ 20 コミット(ce8b80e 時点)。
 
-行番号は 92f0be5 時点の `src/interception.js`(Phase 1 の 1-a〜1-e だけは修正前の 97693c7 時点)。Phase 2〜4(f8dc681 / 31dc3bc / 582c857)で変更したため、現在のファイルとは一致しない。`files/bundle.js`・`src/challenge.js`・`src/injection.js` は変更していないので行番号はそのまま使える。
+行番号は 92f0be5 時点の `src/interception.js`(Phase 1 の 1-a〜1-e だけは修正前の 97693c7 時点)。Phase 2〜5(f8dc681 / 31dc3bc / 582c857 / ce8b80e)で変更したため、現在のファイルとは一致しない。`files/bundle.js`・`src/challenge.js`・`src/injection.js` の行番号はそのまま使える(`src/injection.js` は変更なし。`files/bundle.js` は Phase 5 で 3 行を書き換えただけで行数は変わらず、`src/challenge.js` の変更は 92 行より後)。
 
 分類の基準:
 
@@ -28,6 +28,7 @@
 | #507 / #549 / #487 | 通知・Mentions に新着が届かない、「Loading…」のまま | f8dc681 | Phase 2。実機確認は問題なし(2026-10-17) |
 | #520 / #435 / #563 / #497 / #427 / #387 / #131 / #496 | 広告ツール経由の投稿の欠落、動画カード、長文の see more、ミュート・ブロックの漏れ | 31dc3bc | Phase 3。実機確認は問題なし(2026-10-17)。#563 と #496 はコード変更なし |
 | #545 / #428 / #197 / #533 / #548 / #505 | ブックマークの混在、アカウント別のデッキ保存、リストメンバー、ユーザー検索 | 582c857 | Phase 4。実機確認は問題なし(2026-10-17) |
+| #550 / #547 / #511 / #518 / #512 / #498 / #501 / #381 / #338 / #106 | 起動・カラムの読み込みが終わらず理由も出ない、デスクトップ通知がすぐ消える、`x.com` のリンクが新規タブ | ce8b80e | Phase 5。実機確認は問題なし(2026-10-17) |
 
 ---
 
@@ -183,16 +184,23 @@ Phase 1 の副作用を先に潰すために扱った。変更は f8dc681(`src/i
 
 ---
 
-## Phase 5: 起動・環境
+## Phase 5: 起動・環境(完了)
 
-| Issue | 状況 | 対応 |
+**状態: 完了。実機確認も問題なし(2026-10-17)。** 変更は ce8b80e(`src/interception.js`・`src/challenge.js`・`files/bundle.js`)。`node --test tests/*.test.cjs` は 65 件通過。
+
+| Issue | 原因(確認済み / 推定) | 対応 |
 |---|---|---|
-| #550 / #547 / #511 / #518 / #512 / #498 / #501 ロード中で止まる | 初回起動のハングは 9e4b789(limex 氏の #562)で修正。残りは challenge solver と X の過負荷 | 無限スピナーではなく理由(solver 失敗 / X エラー / レート制限)を画面に出す。#549 の「Loading…」(Phase 2-c)も同じ仕組みで扱う |
-| #537 solver の "header not found" | `solver.html` は `tweetdeck.dimden.dev` にホストされており本リポジトリ外(`src/challenge.js` 14 行) | upstream 依存。自前ホストするなら `solver.html` を取り込む |
-| #381 / #338 Win11 でデスクトップ通知がすぐ消える | legacy の `Notification` API | 注入で `requireInteraction` を付与できるか検討 |
-| #321 絵文字選択でフォーカス喪失(macOS Firefox) | UI | 低優先度 |
-| #106 引用ツイートのリンクが新規タブ | UI | 低優先度 |
+| #550 / #547 / #511 / #518 / #512 / #498 / #501 ロード中で止まる | 初回起動のハングの一つは 9e4b789(limex 氏の #562)で修正済み。残りの一つは、jQuery 2.1.4 の xhr transport がハンドラを外してから `responseText` を読むこと(`files/vendor.js` 2796 行)。ルートの `afterRequest` がそこで例外を投げると(429 の平文や HTML のエラーページを `JSON.parse` する verify_credentials など)、要求が完了しないまま残り、起動はスピナー、カラムは「Loading…」のままになる。失敗しても legacy は理由を出さない(401 / 403 は空のログイン画面、それ以外は "Error initializing TweetDeck") | 実装済み。`afterRequest` の例外は捕まえて JSON でない本文を返し、jQuery に parse error として失敗させる。起動とカラムの要求について失敗の理由(レート制限と解除時刻 / X のエラー / solver 失敗 / 読めない応答 / 401・403 / 通信)を記録し、起動前はログイン画面の文言に、起動後はトーストに出す(同じ理由とカラム種別で 5 分に 1 回、レート制限は解除時刻まで。401・403 と通信エラーはトーストにしない)。スピナーが 30 秒残ったら、失敗の理由か応答待ちの要求を Reload リンクと一緒にスピナーの下に出す。solver の iframe が読み込まれないときも 30 秒で失敗させる(`src/challenge.js`)。Phase 2-c の 1・2(#549 の「Loading…」)も同じトーストで扱う |
+| #537 solver の "header not found" | ホスト版の `solver.html?4` は 2026-10-17 時点で header regex を使っておらず、このエラーは出ない(初期化の失敗は "Module ID not found" / "Default export not found") | 変更なし。solver が失敗したときは、上の仕組みでトーストかログイン画面に理由が出る |
+| #381 / #338 Win11 でデスクトップ通知がすぐ消える | legacy が表示の 5 秒後に `close()` している(`TD.controller.notifications`、`files/bundle.js` 32239-32242 行)。Windows ではアクションセンターからも消える | 実装済み。`window.Notification` を差し替え、legacy の `onshow`(閉じるタイマーだけ)を無視する。表示時間は OS の設定に従う |
+| #106 引用ツイートのリンクが新規タブ | `TD.util` の permalink 判定が `twitter.com` だけ(`files/bundle.js` 974 行)。いまの X は `x.com` の URL を返すので、ツイートへのリンクも外部リンク扱いになる。2023 年の報告と同じ原因かは未確認 | 実装済み。`x.com` と `www.` / `mobile.` も同じ扱いにする。`home` / `explore` / `i` など x.com のアプリのパスはユーザー名と見なさない。`/i/status/<id>` はツイートとして開く |
+| #321 絵文字選択でフォーカス喪失(macOS Firefox) | UI。手元の環境で再現できない | 未対応(低優先度) |
 | #528 Firefox Nightly / #493 署名 / #521 Win7 | パッケージング・配布 | 本フォークの範囲外 |
+
+### Phase 5 のテスト
+
+- 自動テスト(済み): `tests/failure-notices.test.cjs` に 7 件。読めない 429 でも要求が完了しログイン画面にレート制限と解除時刻が出ること、読めない 200 が parse error で失敗すること、起動後のトーストが理由とカラム種別ごとに 1 回であること、solver 失敗の理由がトーストに出ること、自前で返した失敗(cursor 無しなど)は理由に数えず GraphQL のエラーページは X のメッセージを出すこと、応答待ちの要求名と Reload がスピナーの下に出てログイン画面に替わったら止まること。`tests/desktop-notifications.test.cjs`(legacy の閉じるタイマーが付かない)、`tests/challenge.test.cjs`(iframe が読み込まれないときの失敗と、読み込まれたあとの 20 秒)、`tests/twitter-links.test.cjs`(`x.com` の permalink)。
+- 実機(2026-10-17、問題なし): 通常の起動とカラムの読み込みに変化が無いこと(トーストが出ないこと)。デスクトップ通知が 5 秒で消えず OS の設定どおりに残ること。ツイート本文の `x.com/.../status/...` のリンクがカラム内で開き、`x.com/<ユーザー>` がプロフィールで開くこと。レート制限や X のエラーは狙って起こせないので、出たときに文言を確かめる。
 
 ---
 
@@ -211,6 +219,6 @@ Phase 1 の副作用を先に潰すために扱った。変更は f8dc681(`src/i
 ## 進め方
 
 - Phase ごとに PR を分け、`tests/` に `node:test` のケースを足す。実行は `node --test tests/*.test.cjs`。
-- Phase 1 から Phase 4 までの実機確認は 2026-10-17 に問題なし。
-- 残りは Phase 5(起動・環境)と upstream への PR。
+- Phase 1 から Phase 5 までの実機確認は 2026-10-17 に問題なし。
+- 残りは upstream への PR と、Phase 5 で未対応の #321。
 - upstream へは #554(RTL)、#552(Mentions)、Phase 1(92f0be5 / bfcbdd3)の順で PR を出す。起動ハングの修正は limex 氏の #562 が未マージで close されているので、出すならクレジット付きで出し直す。
