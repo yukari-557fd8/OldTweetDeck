@@ -572,6 +572,30 @@ function parseTweet(res) {
     }
 }
 
+// Legacy TweetDeck polled REST with `since_id` set to its second-newest tweet, so every page
+// overlapped the newest cached tweet and FeedPoller could tell a real gap from "nothing new".
+// Our cursor-based polls only return entries above the previous page, so every non-empty poll
+// looked like a gap: FeedPoller.forgetAll() wiped its cache, and anything that refills columns
+// from that cache (theme, font size, column width and sensitive-media toggles) came back with
+// only the last poll's tweets. Treat a page as covering everything above the lower bound it was
+// asked for, which is what REST guaranteed.
+let legacyPollerPatched = false;
+function keepLegacyPollerCache() {
+    if (legacyPollerPatched) return;
+    try {
+        const poller = TD.util.poller;
+        const original = poller.makeRequestResultInterval;
+        poller.makeRequestResultInterval = function (chirps, requested) {
+            const covered = original.call(this, chirps, requested);
+            if (covered.empty || !requested.from.finite) return covered;
+            return covered.hull(new requested.constructor(requested.from, requested.to));
+        };
+        legacyPollerPatched = true;
+    } catch (e) {
+        // TD isn't loaded yet; the next state load tries again.
+    }
+}
+
 function getCurrentUserId() {
     let accounts = TD.storage.accountController.getAll();
     let screen_name = TD.storage.accountController.getUserIdentifier();
@@ -2756,6 +2780,7 @@ const proxyRoutes = [
                 localStorage.OTDsettings = JSON.stringify(settings);
             }
             cleanUp();
+            keepLegacyPollerCache();
             console.log('account state', state);
 
             return state;
