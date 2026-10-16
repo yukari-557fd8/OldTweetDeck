@@ -1,9 +1,9 @@
 # 修正ロードマップ(upstream Issue 棚卸し: 2026-10-17 時点)
 
 対象: [dimdenGD/OldTweetDeck](https://github.com/dimdenGD/OldTweetDeck) の open Issue 67 件(2026-10-17 に `gh issue list` で取得)。67 件すべてを下のいずれかの節に分類している。
-本フォークは upstream `main`(8bcb4bb)+ 12 コミット(3571653 時点)。
+本フォークは upstream `main`(8bcb4bb)+ 17 コミット(582c857 時点)。
 
-行番号は 92f0be5 時点の `src/interception.js`(Phase 1 の 1-a〜1-e だけは修正前の 97693c7 時点)。`files/bundle.js` は upstream から変更していないので行番号はそのまま使える。
+行番号は 92f0be5 時点の `src/interception.js`(Phase 1 の 1-a〜1-e だけは修正前の 97693c7 時点)。Phase 2〜4(f8dc681 / 31dc3bc / 582c857)で変更したため、現在のファイルとは一致しない。`files/bundle.js`・`src/challenge.js`・`src/injection.js` は変更していないので行番号はそのまま使える。
 
 分類の基準:
 
@@ -20,17 +20,20 @@
 |---|---|---|---|
 | #554 | RTL 言語で `<html dir="rtl">` が残りレイアウト崩壊 | 01b1ed8 | 注入後に `dir=ltr lang=en-US` を固定。そのまま upstream PR にできる |
 | #552 | Mentions が表示されない | 0eee9e5 | `mentions.json` の遅延を避け `all.json` から Mentions を組み立て。報告者の症状と一致するか要確認 |
-| #509 / #530 / #531 / #536 ほか | Home の下端で追加取得が止まる、連携アカウントで cursor が引けない | 92f0be5 | Phase 1。実機確認は未実施。通知・Mentions に副作用の疑いあり(Phase 2-a) |
+| #509 / #530 / #531 / #536 ほか | Home の下端で追加取得が止まる、連携アカウントで cursor が引けない | 92f0be5 / bfcbdd3 | Phase 1。実機確認は問題なし(2026-10-17)。通知・Mentions は Phase 2 で対応済み。実機確認も問題なし |
 | #550 / #547 / #511 系の一部 | 初回起動でスピナーのまま | 9e4b789 / e6d8e49 | limex 氏の upstream PR #562 を取り込んだもの。#562 は 2026-10-12 に作者自身が未マージで close している |
 | #514(closed) | 通常ツイートが RT 表示になる | 6a8dad0 | `TweetWithVisibilityResults` の unwrap |
 | #499 に近い症状 | 操作後にカラムが最新ポーリング分だけになる | 97693c7 | legacy poller のキャッシュを維持。#499(Hide this tweet で消える)にも効いているか要検証 |
-| #488 / #487 の通知側 | 通知カラムの重複・欠落 | a46550b | poller 単位で「配信済み」判定。#488 の「自分や無関係な相手のいいねが出る」症状はこの修正の対象外で未検証。#487 の「更新されない」は Phase 2-a |
+| #488 / #487 の通知側 | 通知カラムの重複・欠落 | a46550b | poller 単位で「配信済み」判定。#488 の「自分や無関係な相手のいいねが出る」症状はこの修正の対象外で未検証。#487 の「更新されない」は Phase 2。実機確認は問題なし(2026-10-17) |
+| #507 / #549 / #487 | 通知・Mentions に新着が届かない、「Loading…」のまま | f8dc681 | Phase 2。実機確認は問題なし(2026-10-17) |
+| #520 / #435 / #563 / #497 / #427 / #387 / #131 / #496 | 広告ツール経由の投稿の欠落、動画カード、長文の see more、ミュート・ブロックの漏れ | 31dc3bc | Phase 3。実機確認は問題なし(2026-10-17)。#563 と #496 はコード変更なし |
+| #545 / #428 / #197 / #533 / #548 / #505 | ブックマークの混在、アカウント別のデッキ保存、リストメンバー、ユーザー検索 | 582c857 | Phase 4。実機確認は未実施 |
 
 ---
 
 ## Phase 1: タイムライン取得の信頼性(完了)
 
-**状態: 完了(2026-10-17、92f0be5)。** 変更は `src/interception.js`、テストは `tests/home-scroll.test.cjs`(7 件追加)と `tests/mentions-route.test.cjs`(send 時の cursor 選択に合わせて更新)。`node --test tests/*.test.cjs` で 32 件すべて通過。
+**状態: 完了。実機確認も問題なし(2026-10-17)。** タイムライン取得は 92f0be5、会話モジュールの古いツイートを時系列の位置に残す変更は bfcbdd3。変更は `src/interception.js`、テストは `tests/home-scroll.test.cjs` と `tests/mentions-route.test.cjs`(send 時の cursor 選択に合わせて更新)。
 
 実装の要点:
 
@@ -40,11 +43,7 @@
 - cursor が無い `max_id` 要求はネットワークに出さず 503 で即応答(1-c)。全件フィルタで空になったページは次の cursor に進める。
 - `TD.controller.FeedPoller` をラップし `EXHAUSTED_API_THRESHOLD` を 1 に、refresh のたびに `intervalOfPossibility` を全域に戻す(1-d)。
 - since ポーリングは 10 分に 1 回 cursor 無しで先頭を取り直す(`TOP_RESYNC_INTERVAL`)。`seenHomeTweets` は上限 2000 の Set(1-e)。List / User の `max_id` 要求が refresh throttle でキャンセルされていた問題も解消。
-- 残課題:
-  - `Math.random() > 0.6` の 40% キャンセルはそのまま(1096 行)。
-  - cursor-top で新着が返らない疑いは実機で要検証(Home は 10 分ごとの再同期で緩和はされる)。
-  - 実機での確認(下記「Phase 1 のテスト」参照)は未実施。
-  - 1-a の修正で、通知・Mentions も連携アカウント自身の cursor-top を使うようになった。cursor-top で新着が返らない疑いが通知で当たっていれば、連携アカウントの通知も止まる(Phase 2-a で対処)。
+- 残課題は無い。`Math.random() > 0.6` の 40% キャンセル(1096 行)は意図的に残しており、実機で問題は出ていない。通知・Mentions の cursor-top は Phase 2 で外し、実機確認も問題なし(2026-10-17)。
 
 対象 Issue: #509, #530, #531, #536, #487, #496, #495 / #517(無駄なリクエストによるレート制限悪化)。
 upstream でも「Home の下端でスピナーが出続ける」「数時間前より古いツイートが出ない」という報告が複数ある(#509, #530)。
@@ -98,34 +97,34 @@ upstream でも「Home の下端でスピナーが出続ける」「数時間前
 ### Phase 1 のテスト
 
 - 自動テスト(済み): `tests/home-scroll.test.cjs` に 8 件。連携アカウントの cursor を send 時に解決すること、会話モジュールの古いツイートの扱い(ページ内と新着取得)と全 ID からの cursor 引き当て、全件フィルタで空のページは次へ進むこと、GraphQL エラーだけの 200 を失敗(503)として返すこと、since ポーリングの cursor と 10 分ごとの再同期、FeedPoller が短いページで止まらないこと、List の同等処理と未知の bound での即時失敗。`tests/mentions-route.test.cjs` は send 時の cursor 選択に合わせて更新。
-- 実機(未実施): 連携アカウントの Home と、会話モジュールを含むページで下端までスクロールして追加取得されること。DevTools の Network で同じ cursor の連続要求が無いこと。
+- 実機(2026-10-17、問題なし): Home で古い元ツイートが時系列を外れないこと。連携アカウントの Home、会話モジュールを含むページの下端までの追加取得、同じ cursor の連続要求が無いこと、cursor-top の新着取得。
 
 ---
 
-## Phase 2: 通知・Mentions の取得(次の優先)
+## Phase 2: 通知・Mentions の取得(完了)
 
-**状態: 未着手(2026-10-17 に調査のみ)。** 対象 Issue: #507, #549, #487(通知側)。
-Phase 1(92f0be5)の副作用の疑いがあるので、表示系より先に扱う。
+**状態: 完了。実機確認も問題なし(2026-10-17)。** 対象 Issue: #507, #549, #487(通知側)。
+Phase 1 の副作用を先に潰すために扱った。変更は f8dc681(`src/interception.js`)。自動テストは `tests/notifications-route.test.cjs` と `tests/mentions-route.test.cjs`。API エラーとレート制限の理由を画面に出すのは Phase 5 のまま。
 
 ### 2-a. cursor-top 付きの新着取得で、未読の通知が返らない疑い(#507, #487)
 
 - 報告: #507「リプライなどの通知が数時間届かず、x.com を開いた瞬間にまとめて届く」。#487 のコメントに「モバイルで既読にするまで OTD に出ず、既読にした直後に出る」「一部の通知カラムは更新され、一部はされない」。
 - 新着取得(since_id)は前回の応答の cursor-top を付けて `all.json` を取る(通知 1684-1689 行、Mentions 1893-1898 行)。Home の `TOP_RESYNC_INTERVAL`(752-764 行)に当たる cursor なしの取り直しは、通知・Mentions には無い。
 - upstream(8bcb4bb)は open 時点で cursor を選ぶので、連携アカウントの要求にはログインアカウントの cursor が付いていた。X がそれを無効として先頭ページを返していたとすれば、「ログインアカウントの列だけ止まり、連携アカウントの列は更新される」という #487 の報告と合う。
-- 見立て(確度: 中。報告どうしの一致による推定で、X の挙動は未検証): `all.json` は cursor-top 付きだと未読の新着を返さず、公式クライアントで既読になると返すようになる。
+- 見立て(報告どうしの一致による推定): `all.json` は cursor-top 付きだと未読の新着を返さず、公式クライアントで既読になると返すようになる。
 - フォークへの影響: 92f0be5 で連携アカウントも自分の cursor-top を使うようになった。見立てが正しければ、連携アカウントの通知・Mentions も止まる。
-- 検証: 新しいリプライが届いた直後に、cursor-top 付きの要求と cursor なしの要求の応答を DevTools の Network で比べる。
+- 実機(2026-10-17、問題なし): ログインアカウントと連携アカウントの両方で、通知と Mentions に新着が届く。
 
-対応:
-- 通知・Mentions にも cursor なしの取り直しを入れる。重複は `notificationDeliveryFilter`(992-1002 行)が legacy の poller の `chirpIndex` で落とすので安全。
-- 通知は即時性が要るので、間隔は Home の 10 分より短くするか、新着取得は常に cursor なしにする(1 ページ 20 件なので、ポーリングの間に 20 件を超えなければ取りこぼさない)。
+対応(実装済み):
+- 通知・Mentions の since 取得は、保存済みの cursor-top を使わず、毎回 cursor なしで `all.json` の先頭を取り直す。Home の 10 分間隔では未読が届くまで待ちが残るため。1 ページ 20 件なので、ポーリングの間に 20 件を超えると取りこぼしうる。
+- 重複は、通知は `notificationDeliveryFilter` が legacy の poller の `chirpIndex` で落とし、Mentions は legacy がツイート id で落とす。
 
-### 2-b. 新着取得の応答で cursor-bottom を上書きしている(要確認)
+### 2-b. 新着取得の応答で cursor-bottom を上書きしている
 
 - 通知(1849-1856 行)・Mentions(1955-1962 行)とも、応答に cursor-bottom があればアカウントごとの 1 キーに無条件で保存する。
 - 新着取得の応答にも cursor-bottom が含まれる場合、次の下スクロールは新着の直下から取り直しになる。全部重複で 0 件になり、legacy が exhausted と判定して下方向の取得が止まる(閾値を 1 にしても 0 件では止まる。interactions は `nonExhaustibleFeedTypes` に入っていない)。
 - #507 のコメント「1 週間より古い通知が出ない」と関係している可能性がある。
-- 対応: cursor-bottom は初回と max_id 要求の応答からだけ保存する。または Phase 1 のページ台帳(`timelinePages`)を通知にも使う。
+- 対応(実装済み): cursor-bottom は初回と max_id 要求の応答からだけ保存する。since 取得の応答では上書きしない。ページ台帳は使っていない。
 
 ### 2-c. 通知カラムが「Loading…」のまま(#549)
 
@@ -136,42 +135,51 @@ Phase 1(92f0be5)の副作用の疑いがあるので、表示系より先に扱�
   2. 429(レート制限)。`all.json` の枠は x.com のタブと共有で、フォークでは Mentions も同じ枠を使う(0eee9e5)。
   3. challenge solver の失敗。`send()` の中で例外を投げ直す(3219-3227 行)ため XHR が送信も完了もされず、legacy の ajax にはタイムアウトが無いので永久に「Loading…」になる。ただしこの場合は全カラムに出るはず。
 - 確定に必要な情報: 影響を受けた利用者の `all.json` のステータスと応答本文、コンソールのエラー。
-- 対応: 3 は `failWithoutRequest` と同じく 503 で失敗させる。1・2 は理由を画面に出す(Phase 5 の項目と共通)。
+- 対応: 3 は実装済み。`solveChallenge` が失敗したらリクエストを送らず、`failWithoutRequest` と同じく 503 で完了させる。1・2 の理由を画面に出すのは Phase 5。
 
-### 2-d. 1 件の不正な通知でページ全体が空になる(要確認)
+### 2-d. 1 件の不正な通知でページ全体が空になる
 
 - mention / reply / quote は、作者 `go.users[tweet.user_id_str]` があるか確かめずに渡している(通知 1776 行、Mentions 1934 行)。作者が `globalObjects.users` に無いと legacy の `TwitterActionMention.fromRESTData`(`bundle.js` 41613)が失敗し、`processActions` の try/catch がページ全体を 0 件にする。
-- 対応: ルート側で作者・対象ツイートが揃わないエントリを飛ばす。
+- 対応(実装済み): `notificationTweet` で、作者または対象ツイートが無いエントリを飛ばす。引用先のツイートか作者が無いときは、その引用だけ外してエントリは残す。通知と Mentions の両方。いいね・RT の対象ツイートも同じ。
 
 ### Phase 2 のテスト
 
-- `tests/notifications-route.test.cjs` / `tests/mentions-route.test.cjs` に追加: 定期的に cursor なしで取ること、新着取得の応答で cursor-bottom を上書きしないこと、作者の無いエントリを飛ばすこと、solver 失敗時に 503 で返すこと。
-- 実機: 2-a の検証(cursor-top 付きと無しの比較)。ログインアカウントと連携アカウントの両方の通知カラム・Mentions カラムで新着が届くこと。
+- 自動テスト(済み): since 取得が cursor を付けないこと、その応答で cursor-bottom を上書きしないこと、作者の無いエントリを飛ばし引用先が欠けてもページを空にしないこと、solver 失敗時に 503 で返しネットワークに送らないこと。`node --test tests/*.test.cjs` は 38 件通過。
+- 実機(2026-10-17、問題なし): ログインアカウントと連携アカウントの両方で、通知カラムと Mentions カラムに新着が届くこと。下方向のスクロールが since 取得のあとでも続くこと。solver 失敗時に「Loading…」のまま止まらないこと。
 
 ---
 
-## Phase 3: 表示・取りこぼし
+## Phase 3: 表示・取りこぼし(完了)
+
+**状態: 完了。実機確認も問題なし(2026-10-17)。** 変更は 31dc3bc(`src/interception.js`)。`node --test tests/*.test.cjs` は 45 件通過。
 
 | Issue | 原因(確認済み / 推定) | 対応 |
 |---|---|---|
-| #520 "Twitter for Advertisers" 経由の投稿が Home から消える | `tweet.source` による除外(1153-1155, 1175-1177 行)。公式アカウントが広告ツールで投稿すると消える | source 判定を廃止し、`entryId` に `promoted` を含むもの / `promotedMetadata` だけ除外 |
-| #520 続き / #435 List では media / card が出ない、動画 unified card | upstream #560 で画像 unified card は対応済み。動画は未対応 | `parseTweetCard` を動画 unified card に拡張 |
-| #563 動画が再生できない(2026-10-14) | 最新の報告。X 側の動画 URL / 認証の変更の可能性 | 再現確認 → `video_info.variants` の扱いと再生ウィンドウの実装を確認 |
-| #497 長文の「see more」 | `note_tweet` は展開済み(179 行〜)。"Enable tweet autoexpand" との関係 | 設定 OFF 時に省略表示 + 展開リンクを出すか確認 |
-| #427 / #387 / #131 ミュート・ブロックが残る | Home(1158, 1180 行)と List(1344 行)はフィルタ済み。Search / Notifications / 引用 / 会話詳細は未適用 | 共通のフィルタ関数に寄せて全ルートに適用 |
-| #496 センシティブ設定のアカウントが Home に出ない | X の HomeLatestTimeline 側の挙動の可能性 | 再現確認。X.com で出て OTD で出ない例の生レスポンスを比較 |
+| #520 "Twitter for Advertisers" 経由の投稿が Home から消える | `tweet.source` による除外。公式アカウントが広告ツールで投稿すると消える | 実装済み。source 判定は廃止。`entryId` に `promoted` を含むものか `promotedMetadata` があるものだけ除外 |
+| #520 続き / #435 動画 unified card | 画像 unified card は summary card に変換済み。動画は TweetDeck が再生できない unified card のまま | 実装済み。動画と animated_gif は `extended_entities.media` のネイティブ動画にする。mp4 の variant が無いカードはそのまま |
+| #563 動画が再生できない(2026-10-14) | 再生ウィンドウは `video_info.variants` の `video/mp4` のうち最高ビットレートを使う(`bundle.js` の `chooseVideoVariant`)。`bundle.js` は変えていない | 実機確認は問題なし(2026-10-17) |
+| #497 長文の「see more」 | 長文は常に全文へ置き換えていた。TweetDeck は末尾が「…」のときだけ Expand tweet を出す | 実装済み。`OTDenableAutoExpand` が OFF のときは省略のまま。ON のときと、Expand が叩く `statuses/show` は全文 |
+| #427 / #387 / #131 ミュート・ブロックが残る | Home と List だけが著者を落としていた | 実装済み。`tweetHidden` を Home / List / Search / 通知 / Mentions / 会話詳細に適用。RT の元著者も落とす。ミュートした人の引用は引用部分だけ外す。ユーザーカラムとブックマークは対象外 |
+| #496 センシティブ設定のアカウントが Home に出ない | OTD に `possibly_sensitive` で落とす処理は無い。コメントの「Home が更新されない」は Phase 1 の症状と重なる | 実機確認は問題なし(2026-10-17) |
 
 ---
 
 ## Phase 4: マルチアカウント・状態保存
 
+**状態: 実装済み。実機未実施。** 変更は 582c857(`src/interception.js`)。自動テストは `tests/bookmarks-route.test.cjs`、`tests/account-routes.test.cjs`、`tests/startup.test.cjs` に計 8 件追加。`node --test tests/*.test.cjs` は 53 件通過。
+
 | Issue | 原因(確認済み / 推定) | 対応 |
 |---|---|---|
-| #545 Bookmarks が複数アカウントで混ざる | cursor キー `bookmarks-${bn}`(1571-1572, 1659 行)と `bookmarkTimes`(1043, 1574-1575 行)にユーザー ID が無い | ユーザー ID でキーを分ける。`receiveTime` の採番もアカウント単位に |
-| #428 アカウント切替でリスト・カラムが消える | `OTDcolumns` / `OTDfeeds` / `OTDsettings` が localStorage にグローバル保存(22-45, 88-115 行) | ログイン中アカウント単位でキーを分けるか、保存時にマージ |
-| #197 ミュートリストが消える | 保存先が同じ仕組みの可能性 | 上と同時に確認 |
-| #533 / #548 リストメンバーの追加・表示 | GraphQL の `ListAddMember` / `ListMembers` 相当ルートの有無 | ルートを実装または修正 |
-| #505 ユーザー検索で "does not exist" | `users/show` 相当のルート | ルートの確認 |
+| #545 Bookmarks が複数アカウントで混ざる | cursor と `bookmarkTimes` がツイート ID だけで、連携アカウントの `x-act-as-user-id` を見ていなかった | 実装済み。キーは `bookmarks-${userId}-${id}` と `${userId}:${id}`。下方向の cursor はヘッダが付いてから付ける |
+| #428 アカウント切替でリスト・カラムが消える | `OTDcolumns` / `OTDfeeds` / `OTDsettings` / `OTDcolumnIds` がログインをまたいで一つ | 実装済み。ログインアカウント(`verifiedUser`)ごとに `OTDsettings:${id}` などへ保存する。Teams のカラムは分割しない。古いグローバルキーは、最初に開いたログインへ一度だけ移す |
+| #197 ミュートリストが消える | 報告はキーワードミュート。設定の `global_filter` に入り、デッキと同じ保存先 | 実装済み。#428 のアカウント別設定に含まれる。アカウントのミュート ID(`mutes/users/ids.json`)は設定画面が x.com 側と案内しており、今回の対象外 |
+| #533 / #548 リストメンバーの追加・表示 | `lists/members.json` と `lists/members/create.json` を GraphQL に変換していなかった | 実装済み。表示は `ListMembers`(`yQ_0-CTekcCY2oFRTskpSw`)。追加は `ListAddMember`、削除は `ListRemoveMember`、複数追加は `create_all.json`。query id は 2026-10 時点の x.com クライアント。メンバー画面は先頭 100 件だけ読む |
+| #505 ユーザー検索で "does not exist" | `users/show.json` が廃止済み REST のまま | 実装済み。`screen_name` は `UserByScreenName`、`user_id` は `UserByRestId`。見つからないときは code 34 のエラーのまま |
+
+### Phase 4 のテスト
+
+- 自動テスト(済み): ブックマークの cursor と `receiveTime` がアカウントをまたがないこと。旧デッキが検証済みログインへ一度だけ移り、別ログインの保存がそれを上書きしないこと。`users/show` の変換と、いないユーザーが code 34 のままであること。リストメンバーの変換と、追加が user id を送ること。
+- 実機(未実施): 拡張を読み直す(`OTDalwaysUseLocalFiles`)。二つのログインでカラムとキーワードミュートがそれぞれ残ること。ブックマークカラムがアカウントごとに並ぶこと。リストのメンバー表示と一人の追加。いるユーザーの検索が「does not exist」にならないこと。
 
 ---
 
@@ -203,6 +211,6 @@ Phase 1(92f0be5)の副作用の疑いがあるので、表示系より先に扱�
 ## 進め方
 
 - Phase ごとに PR を分け、`tests/` に `node:test` のケースを足す。実行は `node --test tests/*.test.cjs`。
-- 実機確認は `x.com/i/tweetdeck` で、Teams 連携アカウントの Home と会話モジュールを含むページを使う。通知・Mentions はログインアカウントと連携アカウントの両方で確かめる。
-- 次の作業は Phase 1 の実機確認と Phase 2-a の検証(同じ実機セッションでできる)。
-- upstream へは #554(RTL)、#552(Mentions)の順で PR を出す。起動ハングの修正は limex 氏の #562 が未マージで close されているので、出すならクレジット付きで出し直す。Phase 1(92f0be5)は実機確認と Phase 2-a の結論が出てから。
+- Phase 1 から Phase 3 までの実機確認は 2026-10-17 に問題なし。
+- Phase 4 は実装済み。実機確認はまだ。次の作業は Phase 4 の実機確認。
+- upstream へは #554(RTL)、#552(Mentions)、Phase 1(92f0be5 / bfcbdd3)の順で PR を出す。起動ハングの修正は limex 氏の #562 が未マージで close されているので、出すならクレジット付きで出し直す。
