@@ -45,7 +45,10 @@ if(localStorage.OTDsettings) {
         settings = null;
     }
 }
-let seenNotifications = [];
+let seenNotifications = new Set();
+// Legacy chirp id -> the position we first handed out for it, so a notification that has to be
+// re-sent (another column's poller didn't have it yet) doesn't jump when its aggregate moves.
+let notificationPositions = new Map();
 let seenHomeTweets = {};
 let timings = {
     home: {},
@@ -721,6 +724,53 @@ function extractAssignedJSON(html, varName = "window.__INITIAL_STATE__") {
       return out;
     }
 }
+// Legacy TweetDeck derives a chirp id from the REST action object (generateInternalID on
+// TwitterActionOnTweet / TwitterActionFollow in bundle.js); mirror it so we can ask its pollers
+// whether they already hold a notification. "reply" renders as a mention, "quote" as quoted_tweet.
+function legacyNotificationId(action, userId, targetId) {
+    const legacyAction = action === "reply" ? "mention" : action === "quote" ? "quoted_tweet" : action;
+    return `${legacyAction}_${userId}_${targetId}`;
+}
+
+function notificationPollers(user_id) {
+    const pollers = [];
+    try {
+        const accountKey = `twitter:${user_id}`;
+        const columns = TD.controller.columnManager.getAll();
+        for (const key in columns) {
+            for (const feed of columns[key].getFeeds()) {
+                if (feed.getType() !== "interactions" || feed.getAccountKey() !== accountKey) continue;
+                const poller = TD.controller.feedManager.getPoller(feed.getKey());
+                if (poller && !pollers.includes(poller)) pollers.push(poller);
+            }
+        }
+    } catch (e) {
+        // TD not ready or its internals changed: notificationDeliveryFilter falls back to the session-wide set.
+    }
+    return pollers;
+}
+
+// Every Notifications column polls through the same route, and one account can have several of
+// them (each filter combination gets its own feed and poller). Judging "already delivered" with one
+// global set starves whichever poller asks second, so judge it per poller instead: a notification
+// is only skipped once every poller for that account already holds it.
+function notificationDeliveryFilter(user_id) {
+    const pollers = notificationPollers(user_id);
+    if (pollers.length === 0) {
+        return (id) => {
+            if (seenNotifications.has(id)) return false;
+            seenNotifications.add(id);
+            return true;
+        };
+    }
+    return (id) => !pollers.every((poller) => poller.chirpIndex && poller.chirpIndex[id]);
+}
+
+function stableNotificationPosition(id, position) {
+    if (!notificationPositions.has(id)) notificationPositions.set(id, position);
+    return notificationPositions.get(id);
+}
+
 function formatTwitterStyle(date) {
     const days = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
     const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
@@ -1428,6 +1478,7 @@ const proxyRoutes = [
                 const entries = response.timeline.instructions.find((i) => i.addEntries).addEntries.entries;
                 const go = response.globalObjects;
                 const notifications = [];
+                const shouldDeliver = notificationDeliveryFilter(xhr.storage.user_id);
                 for(let entry of entries) {
                     try {
                         if(entry.entryId.startsWith("notification-")) {
@@ -1453,10 +1504,9 @@ const proxyRoutes = [
                                             const user = go.users[userId];
                                             const action = type === "users_retweeted_your_tweet" || type === "users_retweeted_your_retweet" ? "retweet" : "favorite";
                                             if(!tweet || !user) continue;
-                                            const id = `${tweetId}-${userId}-${action}`;
-                                            if(seenNotifications.includes(id)) continue;
-                                            seenNotifications.push(id);
-                                            const notifSortIndex = +sortIndex - (i++);
+                                            const id = legacyNotificationId(action, userId, tweetId);
+                                            if(!shouldDeliver(id)) continue;
+                                            const notifSortIndex = stableNotificationPosition(id, +sortIndex - (i++));
                                             tweet.user = go.users[tweet.user_id_str];
                                             if(tweet.quoted_status_id_str) {
                                                 tweet.quoted_status = go.tweets[tweet.quoted_status_id_str];
@@ -1491,9 +1541,9 @@ const proxyRoutes = [
                                     tweet.user = go.users[tweet.user_id_str];
                                     const type = item.clientEventInfo.element === "user_mentioned_you" ? "mention" : item.clientEventInfo.element === "user_replied_to_your_tweet" ? "reply" : "quote";
                                     
-                                    const id = `${tweetId}-${tweet.user_id_str}-${type}`;
-                                    if(seenNotifications.includes(id)) continue;
-                                    seenNotifications.push(id);
+                                    const id = legacyNotificationId(type, tweet.user_id_str, tweetId);
+                                    if(!shouldDeliver(id)) continue;
+                                    const position = stableNotificationPosition(id, +sortIndex);
     
                                     if(tweet.quoted_status_id_str) {
                                         tweet.quoted_status = go.tweets[tweet.quoted_status_id_str];
@@ -1502,9 +1552,9 @@ const proxyRoutes = [
                                     
                                     notifications.push({
                                         action: type,
-                                        created_at: formatTwitterStyle(new Date(+sortIndex)),
-                                        max_position: sortIndex+"",
-                                        min_position: sortIndex+"",
+                                        created_at: formatTwitterStyle(new Date(position)),
+                                        max_position: position+"",
+                                        min_position: position+"",
                                         sources: [tweet.user],
                                         sources_size: 1,
                                         target_objects: [tweet],
@@ -1521,14 +1571,15 @@ const proxyRoutes = [
                                     for(const userId of users) {
                                         const user = go.users[userId];
                                         if(!user) continue;
-                                        const id = `${userId}-follow`;
-                                        if(seenNotifications.includes(id)) continue;
-                                        seenNotifications.push(id);
+                                        // legacy builds this id from (source user, target user) and OTD hands it the same user for both
+                                        const id = legacyNotificationId("follow", userId, userId);
+                                        if(!shouldDeliver(id)) continue;
+                                        const position = stableNotificationPosition(id, +sortIndex);
                                         notifications.push({
                                             action: "follow",
-                                            created_at: formatTwitterStyle(new Date(+sortIndex)),
-                                            max_position: sortIndex+"",
-                                            min_position: sortIndex+"",
+                                            created_at: formatTwitterStyle(new Date(position)),
+                                            max_position: position+"",
+                                            min_position: position+"",
                                             sources: [user],
                                             sources_size: 1,
                                             target_objects: [user],
