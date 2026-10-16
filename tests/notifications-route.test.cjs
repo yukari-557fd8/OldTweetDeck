@@ -36,7 +36,7 @@ const aggregate = (element, id, sortIndex, userIds, tweetIds) => ({
 const single = (element, id, sortIndex, tweetId) => ({
     entry: { entryId: 'notification-' + id, sortIndex: String(sortIndex), content: { item: { clientEventInfo: { element }, content: { tweet: { id: tweetId } } } } },
 });
-function responseText(items, { tweets = [], users = [] } = {}) {
+function responseText(items, { tweets = [], users = [], top = 'TOP', bottom = 'BOTTOM' } = {}) {
     return JSON.stringify({
         globalObjects: {
             tweets: Object.fromEntries(tweets.map(t => [t.id_str, t])),
@@ -45,8 +45,8 @@ function responseText(items, { tweets = [], users = [] } = {}) {
         },
         timeline: { instructions: [{ addEntries: { entries: [
             ...items.map(i => i.entry),
-            { entryId: 'cursor-top-1', content: { operation: { cursor: { value: 'TOP' } } } },
-            { entryId: 'cursor-bottom-1', content: { operation: { cursor: { value: 'BOTTOM' } } } },
+            { entryId: 'cursor-top-1', content: { operation: { cursor: { value: top } } } },
+            { entryId: 'cursor-bottom-1', content: { operation: { cursor: { value: bottom } } } },
         ] } }] },
     });
 }
@@ -90,6 +90,80 @@ test('ids match what legacy builds: reply -> mention, quote -> quoted_tweet, fol
     // If any id were spelled differently from legacy's generateInternalID, that item would leak through here.
     const route = loadRoute(legacyTD([poller(...legacyIds)]));
     assert.deepEqual(deliver(route, fixture()), []);
+});
+
+test('since polls re-read the top page, and that page does not move the bottom cursor', () => {
+    const route = loadRoute();
+    const prepare = (query, actAs = '42') => {
+        const xhr = {
+            modUrl: 'https://api.x.com/1.1/activity/about_me.json?' + query,
+            modReqHeaders: { 'x-act-as-user-id': actAs }, storage: {},
+            open(method, url) { this.opened = url; },
+        };
+        route.beforeRequest(xhr);
+        route.beforeSend(xhr);
+        return xhr;
+    };
+    assert.ok(!prepare('count=20').modUrl.includes('cursor='));
+    route.afterRequest({ storage: { user_id: '42' }, responseText: responseText([], { bottom: 'PAGE1' }) });
+    assert.ok(prepare('count=20&max_id=5').modUrl.endsWith('&cursor=PAGE1'));
+    route.afterRequest({ storage: { user_id: '42', max_id: '5' }, responseText: responseText([], { bottom: 'PAGE2' }) });
+    assert.ok(!prepare('count=20&since_id=9').modUrl.includes('cursor='));
+    route.afterRequest({ storage: { user_id: '42', since_id: '9' }, responseText: responseText([], { bottom: 'TOP_PAGE' }) });
+    assert.ok(prepare('count=20&max_id=5').modUrl.endsWith('&cursor=PAGE2'));
+    assert.ok(!prepare('count=20&max_id=5', '43').modUrl.includes('cursor='));
+});
+
+test('a mention without its author is skipped and the rest of the page is kept', () => {
+    const route = loadRoute();
+    const page = responseText([
+        single('user_replied_to_your_tweet', 'n2', 900, '101'),
+        single('user_mentioned_you', 'n3', 800, '102'),
+        single('user_quoted_your_tweet', 'n4', 700, '103'),
+    ], {
+        tweets: [tweet('101', '7'), tweet('102', '8'), tweet('103', '9', { quoted_status_id_str: '999' })],
+        users: [user('7'), user('9')],
+    });
+    const delivered = deliver(route, page);
+    assert.deepEqual(delivered.map(summary), ['reply:7:101@900', 'quote:9:103@700']);
+    assert.equal(delivered[1].targets[0].quoted_status, undefined);
+});
+
+class FakeXHR {
+    constructor() {
+        this.readyState = 0; this.status = 0; this.statusText = ''; this.responseText = '';
+        this.headers = {}; this.sent = false;
+        this.onload = null; this.onloadend = null; this.onerror = null; this.onreadystatechange = null;
+    }
+    open() { this.readyState = 1; }
+    setRequestHeader(name, value) { if (this.readyState !== 1) throw new Error('state must be OPENED'); this.headers[name] = value; }
+    send() { if (this.readyState !== 1) throw new Error('state must be OPENED'); this.sent = true; }
+    addEventListener() {}
+    getResponseHeader() { return null; }
+    getAllResponseHeaders() { return ''; }
+    abort() {}
+}
+
+test('a challenge solver failure finishes as 503 without sending', async () => {
+    const context = vm.createContext({
+        localStorage: { twitterAccountID: '42' }, location: { hostname: 'x.com' },
+        navigator: { language: 'en-US' }, XMLHttpRequest: FakeXHR,
+        console: { ...console, log() {}, warn() {}, error() {} }, URL, URLSearchParams,
+        Date, setTimeout, Event: class {}, ProgressEvent: class {},
+        solveChallenge: async () => { throw new Error('header not found'); },
+    });
+    context.window = context;
+    vm.runInContext(source, context);
+    const XHR = vm.runInContext('XMLHttpRequest', context);
+    const xhr = new XHR();
+    xhr.open('GET', 'https://api.x.com/1.1/activity/about_me.json?count=20', true);
+    xhr.setRequestHeader('x-act-as-user-id', '42');
+    const loaded = {};
+    xhr.onload = () => { loaded.status = xhr.status; loaded.text = xhr.responseText; };
+    await xhr.send(null);
+    assert.equal(xhr.sent, false);
+    assert.equal(loaded.status, 503);
+    assert.equal(loaded.text, '[]');
 });
 
 test('a re-sent notification keeps the position it was first delivered with', () => {

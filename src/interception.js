@@ -787,6 +787,18 @@ function notificationsAllUrl(cursor) {
     return `${NOTIFICATIONS_ALL_URL}${cursor ? `&cursor=${cursor}` : ""}`;
 }
 
+// A since poll re-reads the top of all.json with no cursor. cursor-top is suspected of
+// omitting unread notifications (#507, #487), and one page is 20 items. The bottom cursor
+// on that top page is not the column's scroll position; storing it would make the next
+// max_id request refetch the first page until legacy treats the feed as exhausted.
+function storeNotificationCursors(entries, storage, prefix) {
+    const top = findCursor(entries, "top");
+    if (top) cursors[`${prefix}-${storage.user_id}-top`] = top;
+    if (storage.since_id) return;
+    const bottom = findCursor(entries, "bottom");
+    if (bottom) cursors[`${prefix}-${storage.user_id}-bottom`] = bottom;
+}
+
 // Legacy marks a feed as exhausted below a page when a request returns fewer than ten chirps
 // (FeedPoller.EXHAUSTED_API_THRESHOLD in bundle.js) and never asks for older ones again. REST
 // pages were a steady 40, but ours are a GraphQL page minus promoted, muted and unparsable
@@ -977,6 +989,25 @@ function extractAssignedJSON(html, varName = "window.__INITIAL_STATE__") {
 function legacyNotificationId(action, userId, targetId) {
     const legacyAction = action === "reply" ? "mention" : action === "quote" ? "quoted_tweet" : action;
     return `${legacyAction}_${userId}_${targetId}`;
+}
+
+// Legacy's fromRESTData throws when a mention's author is missing, and processActions
+// then drops the whole page. Skip that entry. A quote whose tweet or author is missing
+// is left off the entry instead of failing it.
+function notificationTweet(go, tweetId) {
+    const tweet = go?.tweets?.[tweetId];
+    const user = tweet && go.users?.[tweet.user_id_str];
+    if (!tweet || !user) return null;
+    tweet.user = user;
+    if (tweet.quoted_status_id_str) {
+        const quoted = go.tweets[tweet.quoted_status_id_str];
+        const quotedUser = quoted && go.users?.[quoted.user_id_str];
+        if (quoted && quotedUser) {
+            quoted.user = quotedUser;
+            tweet.quoted_status = quoted;
+        }
+    }
+    return tweet;
 }
 
 function notificationPollers(user_id) {
@@ -1703,9 +1734,7 @@ const proxyRoutes = [
             const user_id = requestUserId(xhr);
             xhr.storage.user_id = user_id;
             let cursor;
-            if (xhr.storage.since_id && cursors[`notifications-${user_id}-top`]) {
-                cursor = cursors[`notifications-${user_id}-top`];
-            } else if (xhr.storage.max_id && cursors[`notifications-${user_id}-bottom`]) {
+            if (!xhr.storage.since_id && xhr.storage.max_id && cursors[`notifications-${user_id}-bottom`]) {
                 cursor = cursors[`notifications-${user_id}-bottom`];
             }
             xhr.modUrl = notificationsAllUrl(cursor);
@@ -1757,18 +1786,13 @@ const proxyRoutes = [
                                     let i = 0;
                                     for(const userId of users) {
                                         for(const tweetId of tweets) {
-                                            const tweet = go.tweets[tweetId];
                                             const user = go.users[userId];
+                                            const tweet = notificationTweet(go, tweetId);
                                             const action = type === "users_retweeted_your_tweet" || type === "users_retweeted_your_retweet" ? "retweet" : "favorite";
                                             if(!tweet || !user) continue;
                                             const id = legacyNotificationId(action, userId, tweetId);
                                             if(!shouldDeliver(id)) continue;
                                             const notifSortIndex = stableNotificationPosition(id, +sortIndex - (i++));
-                                            tweet.user = go.users[tweet.user_id_str];
-                                            if(tweet.quoted_status_id_str) {
-                                                tweet.quoted_status = go.tweets[tweet.quoted_status_id_str];
-                                                tweet.quoted_status.user = go.users[tweet.quoted_status.user_id_str];
-                                            }
     
                                             const sources = [user];
                                             const targets = [tweet];
@@ -1793,20 +1817,14 @@ const proxyRoutes = [
                                 case "user_replied_to_your_tweet": 
                                 case "user_quoted_your_tweet":{
                                     const tweetId = item.content.tweet.id;
-                                    const tweet = go.tweets[tweetId];
+                                    const tweet = notificationTweet(go, tweetId);
                                     if(!tweet) continue;
-                                    tweet.user = go.users[tweet.user_id_str];
                                     const type = item.clientEventInfo.element === "user_mentioned_you" ? "mention" : item.clientEventInfo.element === "user_replied_to_your_tweet" ? "reply" : "quote";
                                     
                                     const id = legacyNotificationId(type, tweet.user_id_str, tweetId);
                                     if(!shouldDeliver(id)) continue;
                                     const position = stableNotificationPosition(id, +sortIndex);
     
-                                    if(tweet.quoted_status_id_str) {
-                                        tweet.quoted_status = go.tweets[tweet.quoted_status_id_str];
-                                        tweet.quoted_status.user = go.users[tweet.quoted_status.user_id_str];
-                                    }
-                                    
                                     notifications.push({
                                         action: type,
                                         created_at: formatTwitterStyle(new Date(position)),
@@ -1860,22 +1878,7 @@ const proxyRoutes = [
                     }
                 }
                 xhr.storage.notifications = notifications;
-                const cursorTop = entries.find(
-                    (e) =>
-                        e.entryId.startsWith("sq-cursor-top-") ||
-                        e.entryId.startsWith("cursor-top-")
-                )?.content?.operation?.cursor?.value;
-                if(cursorTop) {
-                    cursors[`notifications-${xhr.storage.user_id}-top`] = cursorTop;
-                }
-                const cursorBottom = entries.find(
-                    (e) =>
-                        e.entryId.startsWith("sq-cursor-bottom-") ||
-                        e.entryId.startsWith("cursor-bottom-")
-                )?.content?.operation?.cursor?.value;
-                if(cursorBottom) {
-                    cursors[`notifications-${xhr.storage.user_id}-bottom`] = cursorBottom;
-                }
+                storeNotificationCursors(entries, xhr.storage, "notifications");
                 return notifications;
             } catch (e) {
                 console.error(`Error parsing notifications`, e);
@@ -1912,9 +1915,7 @@ const proxyRoutes = [
             const user_id = requestUserId(xhr);
             xhr.storage.user_id = user_id;
             let cursor;
-            if (xhr.storage.since_id && cursors[`mentions-${user_id}-top`]) {
-                cursor = cursors[`mentions-${user_id}-top`];
-            } else if (xhr.storage.max_id && cursors[`mentions-${user_id}-bottom`]) {
+            if (!xhr.storage.since_id && xhr.storage.max_id && cursors[`mentions-${user_id}-bottom`]) {
                 cursor = cursors[`mentions-${user_id}-bottom`];
             }
             xhr.modUrl = notificationsAllUrl(cursor);
@@ -1950,39 +1951,15 @@ const proxyRoutes = [
                             case "user_mentioned_you":
                             case "user_replied_to_your_tweet": 
                             case "user_quoted_your_tweet":{
-                                const tweetId = item.content.tweet.id;
-                                const tweet = go.tweets[tweetId];
+                                const tweet = notificationTweet(go, item.content.tweet.id);
                                 if(!tweet) continue;
-                                tweet.user = go.users[tweet.user_id_str];
-
-                                if(tweet.quoted_status_id_str) {
-                                    tweet.quoted_status = go.tweets[tweet.quoted_status_id_str];
-                                    tweet.quoted_status.user = go.users[tweet.quoted_status.user_id_str];
-                                }
-                                
                                 tweets.push(tweet);
                                 break;
                             }
                         }
                     }
                 }
-                const cursorTop = entries.find(
-                    (e) =>
-                        e.entryId.startsWith("sq-cursor-top-") ||
-                        e.entryId.startsWith("cursor-top-")
-                )?.content?.operation?.cursor?.value;
-                if(cursorTop) {
-                    cursors[`mentions-${xhr.storage.user_id}-top`] = cursorTop;
-                }
-                const cursorBottom = entries.find(
-                    (e) =>
-                        e.entryId.startsWith("sq-cursor-bottom-") ||
-                        e.entryId.startsWith("cursor-bottom-")
-                )?.content?.operation?.cursor?.value;
-                if(cursorBottom) {
-                    cursors[`mentions-${xhr.storage.user_id}-bottom`] = cursorBottom;
-                }
-                
+                storeNotificationCursors(entries, xhr.storage, "mentions");
                 return tweets;
             } catch (e) {
                 console.error(`Error parsing mentions`, e);
@@ -3242,10 +3219,12 @@ XMLHttpRequest = function () {
                     try {
                         this.setRequestHeader('x-client-transaction-id', await solveChallenge(parsedUrl.pathname, method));
                     } catch (e) {
-                        // if(localStorage.secureRequests) {
-                            console.error(`Challenge error for ${method} ${parsedUrl.pathname}:`, e);
-                            throw e;
-                        // }
+                        // Rethrowing leaves the XHR neither sent nor finished. Legacy has no
+                        // timeout, so the column stays on "Loading…". Complete it as a failure.
+                        console.error(`Challenge error for ${method} ${parsedUrl.pathname}:`, e);
+                        failWithoutRequest(this, `challenge solver failed for ${method} ${parsedUrl.pathname}`);
+                        emulateResponse(this);
+                        return;
                     }
                 }
             }

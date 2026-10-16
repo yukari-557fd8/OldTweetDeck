@@ -25,13 +25,13 @@ const single = (element, id, sortIndex, tweetId) =>
     ({ entryId: 'notification-' + id, sortIndex: String(sortIndex), content: { item: { clientEventInfo: { element }, content: { tweet: { id: tweetId } } } } });
 const aggregate = (element, id, sortIndex) =>
     ({ entryId: 'notification-' + id, sortIndex: String(sortIndex), content: { item: { clientEventInfo: { element }, content: { notification: { id } } } } });
-function allJsonPage(entries, { tweets = [], users = [] } = {}) {
+function allJsonPage(entries, { tweets = [], users = [], top = 'TOP', bottom = 'BOTTOM' } = {}) {
     return JSON.stringify({
         globalObjects: { tweets: Object.fromEntries(tweets.map(t => [t.id_str, t])), users: Object.fromEntries(users.map(u => [u.id_str, u])), notifications: {} },
         timeline: { instructions: [{ addEntries: { entries: [
             ...entries,
-            { entryId: 'cursor-top-1', content: { operation: { cursor: { value: 'TOP' } } } },
-            { entryId: 'cursor-bottom-1', content: { operation: { cursor: { value: 'BOTTOM' } } } },
+            { entryId: 'cursor-top-1', content: { operation: { cursor: { value: top } } } },
+            { entryId: 'cursor-bottom-1', content: { operation: { cursor: { value: bottom } } } },
         ] } }] },
     });
 }
@@ -47,13 +47,26 @@ test('mentions are read from the all.json notifications timeline, with their own
 
     route.afterRequest({ storage: { user_id: '42' }, responseText: allJsonPage([]) });
 
+    // since polls re-read the top page. cursor-top is suspected of hiding unread items.
     const newer = prepare(legacyRequest('count=40&since_id=5'));
-    assert.ok(newer.modUrl.endsWith('&cursor=TOP'), newer.modUrl);
+    assert.ok(!newer.modUrl.includes('cursor='), newer.modUrl);
     const older = prepare(legacyRequest('count=40&max_id=5'));
     assert.ok(older.modUrl.endsWith('&cursor=BOTTOM'), older.modUrl);
     // another account's request must not borrow 42's cursors
-    const other = prepare(legacyRequest('count=40&since_id=5', '43'));
+    const other = prepare(legacyRequest('count=40&max_id=5', '43'));
     assert.ok(!other.modUrl.includes('cursor='), other.modUrl);
+});
+
+test('a since poll does not replace the bottom cursor the column has scrolled to', () => {
+    const route = loadRoute();
+    const prepare = (xhr) => { route.beforeRequest(xhr); route.beforeSend(xhr); return xhr; };
+    prepare(legacyRequest('count=40'));
+    route.afterRequest({ storage: { user_id: '42' }, responseText: allJsonPage([], { bottom: 'PAGE1' }) });
+    prepare(legacyRequest('count=40&max_id=5'));
+    route.afterRequest({ storage: { user_id: '42', max_id: '5' }, responseText: allJsonPage([], { bottom: 'PAGE2' }) });
+    route.afterRequest({ storage: { user_id: '42', since_id: '9' }, responseText: allJsonPage([], { bottom: 'TOP_PAGE' }) });
+    const older = prepare(legacyRequest('count=40&max_id=5'));
+    assert.ok(older.modUrl.endsWith('&cursor=PAGE2'), older.modUrl);
 });
 
 test('only mention, reply and quote entries of the page become tweets', () => {
@@ -74,6 +87,21 @@ test('only mention, reply and quote entries of the page become tweets', () => {
     assert.deepEqual(tweets.map(t => t.user.screen_name), ['user7', 'user8', 'user9']);
     assert.equal(tweets[2].quoted_status.id_str, '100');
     assert.equal(tweets[2].quoted_status.user.screen_name, 'user42');
+});
+
+test('a mention without its author is skipped, and a missing quote does not empty the page', () => {
+    const route = loadRoute();
+    const page = allJsonPage([
+        single('user_replied_to_your_tweet', 'n2', 900, '101'),
+        single('user_mentioned_you', 'n4', 800, '102'),
+        single('user_quoted_your_tweet', 'n5', 700, '103'),
+    ], {
+        tweets: [tweet('101', '7'), tweet('102', '8'), tweet('103', '9', { quoted_status_id_str: '999' })],
+        users: [user('7'), user('9')],
+    });
+    const tweets = Array.from(route.afterRequest({ storage: { user_id: '42' }, responseText: page }));
+    assert.deepEqual(tweets.map(t => t.id_str), ['101', '103']);
+    assert.equal(tweets[1].quoted_status, undefined);
 });
 
 test('rate-limit headers are halved for the shared all.json quota and left alone when absent', () => {
