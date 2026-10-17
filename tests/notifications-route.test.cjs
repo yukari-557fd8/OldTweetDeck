@@ -185,3 +185,36 @@ test('a re-sent notification keeps the position it was first delivered with', ()
         { tweets: [tweet('100', '42')], users: [user('7'), user('8'), user('11'), user('42')] });
     assert.deepEqual(deliver(route, later).map(summary), ['favorite:7:100@1000', 'favorite:8:100@999', 'favorite:11:100@1998']);
 });
+
+// X keeps a follow aggregate's id, lists its newest follower first and moves it to that follow's time.
+const poll = (route, text) => Array.from(route.afterRequest({ storage: { user_id: '42', since_id: '1' }, responseText: text })).map(summary);
+const followers = (ids) => responseText([aggregate('users_followed_you', 'f1', 2000, ids, [])], { users: ids.map(user) });
+
+test('a follow aggregate that comes back to the top in a poll brings only its new follower', () => {
+    const route = loadRoute();
+    // on the first load the aggregate sat below the page legacy reads
+    deliver(route, responseText([single('user_replied_to_your_tweet', 'n2', 900, '101')], { tweets: [tweet('101', '7')], users: [user('7')] }));
+    assert.deepEqual(poll(route, followers(['12', '9', '10', '11'])), ['follow:12:12@2000']);
+});
+
+test('a follow aggregate seen before gives a poll every follower it gained', () => {
+    const route = loadRoute();
+    const first = responseText([aggregate('users_followed_you', 'f1', 600, ['9', '10'], [])], { users: [user('9'), user('10')] });
+    assert.deepEqual(deliver(route, first).map(summary), ['follow:9:9@600', 'follow:10:10@599']);
+    assert.deepEqual(poll(route, followers(['13', '12', '9', '10'])), ['follow:13:13@2000', 'follow:12:12@1999']);
+});
+
+test('every Notifications column that reads the same poll page gets the new follower', () => {
+    const first = poller();
+    const route = loadRoute(legacyTD([first, poller()]));
+    assert.deepEqual(poll(route, followers(['12', '9'])), ['follow:12:12@2000']);
+    first.chirpIndex['follow_12_12'] = {};   // the first column took it; the second has not yet
+    assert.deepEqual(poll(route, followers(['12', '9'])), ['follow:12:12@2000']);
+});
+
+test('like aggregates are left as they were: an unseen one in a poll still brings every like', () => {
+    const route = loadRoute();
+    const page = responseText([aggregate('users_liked_your_tweet', 'l1', 2000, ['8', '7'], ['100'])],
+        { tweets: [tweet('100', '42')], users: [user('7'), user('8'), user('42')] });
+    assert.deepEqual(poll(route, page), ['favorite:8:100@2000', 'favorite:7:100@1999']);
+});

@@ -1542,6 +1542,37 @@ function stableNotificationPosition(id, position) {
     return notificationPositions.get(id);
 }
 
+// X folds new followers into one notification ("A and 9 others followed you"). It keeps that
+// notification's id, puts the newest follower first, moves it to the time of that follow and gives
+// no time for the others. Such an aggregate spans hours and drops below the page a poll reads, so
+// its next follower brought it back to the top with everyone in it, and each follower not
+// delivered yet arrived at the new time: old followers filled the top of the column. A poll
+// (since_id) now only gets the followers an aggregate gained since it was last seen, or its first
+// one when it was not seen before in this session. The first load and scrolling still get them
+// all. The answer is kept per state of the aggregate, so every Notifications column that reads the
+// same page gets the same followers. Likes and retweets are left as they were: their aggregates
+// stay near the top while the post is active, and taking only the first of an unseen one would
+// drop likes that arrive together.
+const AGGREGATE_STATE_LIMIT = 1000;
+const aggregateStates = new Map();
+
+function freshAggregateActions(user_id, notificationId, sortIndex, ids) {
+    const key = `${user_id}:${notificationId}`;
+    let state = aggregateStates.get(key);
+    if (!state || state.sortIndex !== sortIndex) {
+        const members = state && state.members;
+        state = {
+            sortIndex,
+            members: new Set([...(members || []), ...ids]),
+            fresh: new Set(members ? ids.filter((id) => !members.has(id)) : ids.slice(0, 1)),
+        };
+        aggregateStates.delete(key);
+        aggregateStates.set(key, state);
+        if (aggregateStates.size > AGGREGATE_STATE_LIMIT) aggregateStates.delete(aggregateStates.keys().next().value);
+    }
+    return state.fresh;
+}
+
 function formatTwitterStyle(date) {
     const days = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
     const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
@@ -2467,6 +2498,7 @@ const proxyRoutes = [
                 const go = response.globalObjects;
                 const notifications = [];
                 const shouldDeliver = notificationDeliveryFilter(xhr.storage.user_id);
+                const poll = Boolean(xhr.storage.since_id);
                 for(let entry of entries) {
                     try {
                         if(entry.entryId.startsWith("notification-")) {
@@ -2545,13 +2577,16 @@ const proxyRoutes = [
                                 case "users_followed_you": {
                                     const nf = go.notifications[notif.id];
                                     const users = nf.template.aggregateUserActionsV1.fromUsers.map(u => u.user.id);
-                                    for(const userId of users) {
-                                        const user = go.users[userId];
+                                    // legacy builds this id from (source user, target user) and OTD hands it the same user for both
+                                    const ids = users.map(userId => legacyNotificationId("follow", userId, userId));
+                                    const fresh = freshAggregateActions(xhr.storage.user_id, notif.id, sortIndex, ids);
+                                    for(let i = 0; i < users.length; i++) {
+                                        const id = ids[i];
+                                        if(poll && !fresh.has(id)) continue;
+                                        const user = go.users[users[i]];
                                         if(!user || userHidden(user)) continue;
-                                        // legacy builds this id from (source user, target user) and OTD hands it the same user for both
-                                        const id = legacyNotificationId("follow", userId, userId);
                                         if(!shouldDeliver(id)) continue;
-                                        const position = stableNotificationPosition(id, +sortIndex);
+                                        const position = stableNotificationPosition(id, +sortIndex - i);
                                         notifications.push({
                                             action: "follow",
                                             created_at: formatTwitterStyle(new Date(position)),
