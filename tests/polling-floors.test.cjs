@@ -69,3 +69,8 @@ test('before legacy has loaded nothing is patched, and the next state load appli
     legacy.client.getActivityTimeline('activity/about_me.json', 1, null, 20, null, null, {}, null);
     assert.deepEqual(legacy.calls, [['activity/about_me.json', 'interactions']]);
 });
+
+test('the decider turns faster_notifications off, so Notifications waits for the rate limit like the rest', () => {
+    const decider = vm.runInContext('proxyRoutes', load()).find(r => r.path === '/decider').afterRequest({}).decider;
+    assert.equal(decider.faster_notifications, false);
+});
