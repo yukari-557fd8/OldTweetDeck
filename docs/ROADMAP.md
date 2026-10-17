@@ -3,7 +3,7 @@
 対象: [dimdenGD/OldTweetDeck](https://github.com/dimdenGD/OldTweetDeck) の open Issue 67 件(2026-10-17 に `gh issue list` で取得)。67 件すべてを下のいずれかの節に分類している。
 本フォークは upstream `main`(8bcb4bb)+ 20 コミット(ce8b80e 時点)。
 
-行番号は 92f0be5 時点の `src/interception.js`(Phase 1 の 1-a〜1-e だけは修正前の 97693c7 時点)。Phase 2〜5(f8dc681 / 31dc3bc / 582c857 / ce8b80e)で変更したため、現在のファイルとは一致しない。`files/bundle.js`・`src/challenge.js`・`src/injection.js` の行番号はそのまま使える(`src/injection.js` は変更なし。`files/bundle.js` は Phase 5 で 3 行を書き換えただけで行数は変わらず、`src/challenge.js` の変更は 92 行より後)。
+行番号は 92f0be5 時点の `src/interception.js`(Phase 1 の 1-a〜1-e だけは修正前の 97693c7 時点)。Phase 2〜6(f8dc681 / 31dc3bc / 582c857 / ce8b80e / 4d26629 / 017d2a7)で変更したため、現在のファイルとは一致しない。`files/bundle.js`・`src/challenge.js`・`src/injection.js` の行番号はそのまま使える(`src/injection.js` は変更なし。`files/bundle.js` は Phase 5 で 3 行を書き換えただけで行数は変わらず、`src/challenge.js` の変更は 92 行より後)。
 
 分類の基準:
 
@@ -29,6 +29,7 @@
 | #520 / #435 / #563 / #497 / #427 / #387 / #131 / #496 | 広告ツール経由の投稿の欠落、動画カード、長文の see more、ミュート・ブロックの漏れ | 31dc3bc | Phase 3。実機確認は問題なし(2026-10-17)。#563 と #496 はコード変更なし |
 | #545 / #428 / #197 / #533 / #548 / #505 | ブックマークの混在、アカウント別のデッキ保存、リストメンバー、ユーザー検索 | 582c857 | Phase 4。実機確認は問題なし(2026-10-17) |
 | #550 / #547 / #511 / #518 / #512 / #498 / #501 / #381 / #338 / #106 | 起動・カラムの読み込みが終わらず理由も出ない、デスクトップ通知がすぐ消える、`x.com` のリンクが新規タブ | ce8b80e | Phase 5。実機確認は問題なし(2026-10-17) |
+| (フォークで確認) | 通知カラムと Mentions カラムの更新がずれる、Home の更新間隔がばらつく | 4d26629 / 017d2a7 | Phase 6。5 分間の HAR で間隔と 429 が出ないことは確認(2026-10-18)。2 カラムに同時に出ることの目視は未了 |
 
 ---
 
@@ -204,9 +205,49 @@ Phase 1 の副作用を先に潰すために扱った。変更は f8dc681(`src/i
 
 ---
 
+## Phase 6: 通知・Mentions・Home の取得間隔(実装済み)
+
+**状態: 実装済み(4d26629 / 017d2a7)。** 2026-10-18 に 5 分間の HAR(4d26629 の時点)で、取得間隔と 429 が出ないことを確認した。通知カラムと Mentions カラムに同じ通知が同時に出ることの目視は未了。変更は `src/interception.js`。`node --test tests/*.test.cjs` は 77 件通過。
+
+発端は、通知カラムと Mentions カラムを並べると片方が先に更新されること(2026-10-18)。あわせて、Home と通知を優先し、ブックマークは後回しにする方針で取得間隔を見直した。upstream の Issue には対応するものが無い。
+
+### 6-a. 通知と Mentions の更新がずれる
+
+- 両カラムとも `all.json` の先頭ページを読むが、legacy のタイマーが別々で、開始時刻も間隔も違っていた。
+- 通知: legacy が `about_me.json` を feed type なしで要求する(`files/bundle.js` 43755 の `getInteractionsTimeline`)ため、レート制限ヘッダを読まない。既定の 45 秒を decider の `faster_notifications` が 15 秒に縮めた、固定の 15 秒だった。
+- Mentions: ヘッダから間隔を計算する(下限 10 秒)。0eee9e5 で枠を 2 分の 1 に見せていたため、時間枠の後半ほど遅くなり、実際の残りが 22 回を切るとリセットまで止まった。
+- 対応(4d26629): 同じアカウントの先頭ページの取得を 1 本にまとめる。取得中と取得後 5 秒以内の先頭ページ要求にはその応答を渡し、取得できたらもう一方の種別をすぐ更新してタイマーをリセットする。ヘッダの半減は削除した。
+
+### 6-b. 取得間隔
+
+| カラム | 変更前 | 変更後 | 15 分あたり(HAR の実測) |
+|---|---|---|---|
+| Home | legacy は約 5 秒ごと。35 秒以内の新着取得の 40% をランダムに捨てていた(upstream ed5432c) | 捨てない。下限 4 秒 | 約 225 回(枠 500) |
+| 通知・Mentions | 固定 15 秒 / 下限 10 秒 | 通知もヘッダを読む。下限 7 秒 | 約 128 回(枠 180) |
+| ブックマーク | 下限 4 秒(枠を 5 分の 1 に見せる処理はそのまま) | 下限 60 秒 | — |
+
+- 下限は localStorage で秒単位に上書きできる: `OTDhomeRefreshSeconds` / `OTDnotificationsRefreshSeconds`(通知と Mentions)/ `OTDbookmarksRefreshSeconds`。
+- legacy のスケジューラは 1 秒ごとに判定するので、実際の間隔は下限〜下限 + 1 秒。
+- `faster_notifications` は、通知がヘッダを読むようになった後は「枠を使い切っても 15 秒ごとに取りに行き 429 を受け続ける」効果しか残らないため、decider で無効にした(017d2a7)。
+
+### 6-c. 調査結果(2026-10-18 の HAR)
+
+- `NotificationsTimeline`(GraphQL、`EUX2EwvgT4f9F7sC4A59Eg`)の「All」は、`all.json` と同じ 20 件を返す(`entryId`・`sortIndex` まで一致)。「Mentions」(`timeline_type: "Mentions"`)は cursor なしの先頭ページが約 4 時間遅れ、cursor-top 付きの取得で追いついた(`mentions.json` と同じ症状)。
+- レート制限は `NotificationsTimeline` が 1500 回 / 15 分で x.com と共有、`all.json` は 180 回 / 15 分で x.com は使っていない。新着の速さは変わらないので、移行は見送った。`all.json` が廃止されたときの切り替え先にはできる。通知の形(`TimelineNotification` の `template.from_users` / `target_objects`、`TimelineTweet` の `tweet_results`)は既存の `legacyUserFromGraph` / `safeParseTweet` で変換できる。引用通知の形は未確認。
+- x.com のフォロー中タブは、放置中にホームを取得しない(3 分半で 0 回)。ピリオドキーでは約 1 秒間隔で取得し、すべて 200。通知は未読数(`ViewerBadgeCounts`)を 30 秒ごとに見るだけ。
+- `HomeLatestTimeline` の枠は GET と POST で別。OTD(GET、`cWF3cqWadLlIXA6KJWhcew`)と x.com の GET(`NmDBT3APtNxDpMqIEauu7A`)は同じ枠を使っているとみられる(推測)。
+- 残課題: Home のクエリ ID が x.com の現行(`NmDBT3APtNxDpMqIEauu7A`、POST 併用)と違う。古い ID が廃止されると Home が 400 / 404 になる。
+
+### Phase 6 のテスト
+
+- 自動テスト(済み): `tests/shared-top-page.test.cjs` に 6 件。取得中と 5 秒以内の先頭ページ要求が応答を共有すること、取得後にもう一方の種別が更新されタイマーがリセットされること、失敗した応答は共有しないこと、スクロールと別アカウントは共有しないこと、XHR Proxy 経由でも共有した応答を legacy が読めること。`tests/polling-floors.test.cjs` に 5 件。下限の値と localStorage での上書き、通知の要求に feed type が付くこと、legacy の読み込み前に呼ばれても後で一度だけ適用されること、`faster_notifications` が無効なこと。`tests/home-scroll.test.cjs` に 1 件。Home の新着取得が 20 回続けて捨てられないこと(変更前のコードでは失敗する)。`tests/mentions-route.test.cjs` のヘッダ半減のテストは置き換えた。
+- 実機(2026-10-18): 通知カラムと Mentions カラムを置いて 5 分。Home は 4.0 秒ごと、`all.json` は 7.0 秒ごとに 1 本で、Mentions からの要求は 0 本、すべて 200。ブックマークカラムが無かったため 60 秒の下限は未確認。両カラムに同時に出ることの目視も未了。
+
+---
+
 ## 対応しない / できないもの
 
-- **X 側の仕様・運用**: #551(Teams からの投稿で凍結)、#529(X Pro が Premium+ 限定)、#522(検索演算子の制限。upstream 作者も X 側と判断)、#506(DM は新 Chat に移行。upstream 作者が「修正不可能」と明言)、#492(アカウント制限。同系統の #469 は close 済み)、#462 / #510 / #259(Teams 招待。X の delegate 挙動)、#517 / #495(レート制限。Phase 1 で無駄なリクエストを減らして緩和はできる)
+- **X 側の仕様・運用**: #551(Teams からの投稿で凍結)、#529(X Pro が Premium+ 限定)、#522(検索演算子の制限。upstream 作者も X 側と判断)、#506(DM は新 Chat に移行。upstream 作者が「修正不可能」と明言)、#492(アカウント制限。同系統の #469 は close 済み)、#462 / #510 / #259(Teams 招待。X の delegate 挙動)、#517 / #495(レート制限。Phase 1 で無駄なリクエストを減らして緩和はできる。Phase 6 で通知カラムも残り回数に合わせて減速するようにした)
 - **upstream 依存(Patreon 版)**: #515(Patreon 連携後に List がほとんど読み込まれない。報告者・コメント者とも連携ユーザーで、連携前は読み込めていた)
   - `src/injection.js` 168-188 が、Patreon のトークンを付けて `oldtd.org/api/scripts` から追加スクリプトを読み込む。トークンなしで返るのは `auth.js`(連携 UI)だけで、支援者向けの修正はこのリポジトリに無いため、検証も修正もできない。
   - 回避策: 設定の Patreon「Logout」で連携を外すと公開版の List ルートに戻る(レート制限回避は失われる)。
@@ -219,6 +260,6 @@ Phase 1 の副作用を先に潰すために扱った。変更は f8dc681(`src/i
 ## 進め方
 
 - Phase ごとに PR を分け、`tests/` に `node:test` のケースを足す。実行は `node --test tests/*.test.cjs`。
-- Phase 1 から Phase 5 までの実機確認は 2026-10-17 に問題なし。
-- 残りは upstream への PR と、Phase 5 で未対応の #321。
+- Phase 1 から Phase 5 までの実機確認は 2026-10-17 に問題なし。Phase 6 は 2026-10-18 に取得間隔だけ確認し、目視とブックマークの確認が残っている。
+- 残りは upstream への PR、Phase 5 で未対応の #321、Phase 6 の残課題(Home のクエリ ID)。
 - upstream へは #554(RTL)、#552(Mentions)、Phase 1(92f0be5 / bfcbdd3)の順で PR を出す。起動ハングの修正は limex 氏の #562 が未マージで close されているので、出すならクレジット付きで出し直す。
