@@ -32,7 +32,6 @@ function load(TD) {
     });
     context.window = context;
     vm.runInContext(source, context);
-    vm.runInContext('Math.random = () => 0', context);   // the Home poll throttle drops 40% of polls at random
     return context;
 }
 const route = (context, path) => vm.runInContext('proxyRoutes', context).find(r => r.path === path);
@@ -156,6 +155,17 @@ test('since polls use the page cursor and resync from the top every ten minutes'
     vm.runInContext('topFetches', ctx)['home-42'] = 0;      // the last cursor-less fetch was long ago
     assert.equal(cursorIn((await homeRequest(ctx, 'count=40&since_id=20', '42')).xhr), undefined);
     assert.equal(cursorIn((await homeRequest(ctx, 'count=40&since_id=20', '42')).xhr), 'TOP1');
+});
+
+test('since polls are not dropped at random: legacy\'s scheduler paces them', async () => {
+    const ctx = load();
+    const first = await homeRequest(ctx, 'count=40', '42');
+    first.xhr.respond(200, page([entry('30'), entry('20'), cursor('top', 'TOP1'), cursor('bottom', 'BOT1')]));
+    for (let i = 0; i < 20; i++) {
+        const poll = await homeRequest(ctx, 'count=40&since_id=20', '42');
+        assert.equal(poll.xhr.sent, true);
+        assert.equal(cursorIn(poll.xhr), 'TOP1');
+    }
 });
 
 test('legacy FeedPoller stops treating a short page as the end of the feed', () => {

@@ -136,7 +136,6 @@ let seenNotifications = new Set();
 let notificationPositions = new Map();
 let seenHomeTweets = {};
 let timings = {
-    home: {},
     list: {},
     user: {},
     search: {},
@@ -1160,6 +1159,77 @@ function storeNotificationCursors(entries, storage, prefix) {
     if (bottom) cursors[`${prefix}-${storage.user_id}-bottom`] = bottom;
 }
 
+// The Notifications and Mentions columns both read the top of all.json, each on its own legacy
+// timer. The timers neither started together nor shared a period (see POLL_FLOORS), so the same
+// mention reached one column well after the other, and both fetched the same page. Now a top-page
+// request that goes out also answers every top-page request of that account made while it is in
+// flight or shortly after, and when it lands the other column type polls at once.
+const SHARED_TOP_PAGE_TTL = 5 * 1000;
+const sharedTopPages = {};
+
+function notificationsResponseText(xhr) {
+    return xhr.storage.sharedTopPage ?? xhr.responseText;
+}
+
+function answerWithTopPage(xhr, text) {
+    xhr.storage.sharedTopPage = text;
+    emulateResponse(xhr);
+}
+
+function sendNotificationsTopPage(xhr, data, otherFeedType) {
+    const user_id = xhr.storage.user_id;
+    const shared = sharedTopPages[user_id];
+    if (shared && shared.waiting) {
+        shared.waiting.push({ xhr, data });
+        return;
+    }
+    if (shared && Date.now() - shared.time < SHARED_TOP_PAGE_TTL) {
+        answerWithTopPage(xhr, shared.text);
+        return;
+    }
+    const page = { waiting: [] };
+    sharedTopPages[user_id] = page;
+    xhr.addEventListener("loadend", () => {
+        const waiting = page.waiting;
+        page.waiting = null;
+        // Answering a request runs legacy's handlers, and one that throws must not strand the rest.
+        const settle = (answer) => {
+            for (const other of waiting) {
+                try {
+                    answer(other);
+                } catch (e) {
+                    console.error(e);
+                }
+            }
+        };
+        if (xhr.status !== 200) {
+            // Nothing to share. The others ask X themselves, as they would have without this.
+            if (sharedTopPages[user_id] === page) delete sharedTopPages[user_id];
+            settle((other) => other.xhr.send(other.data));
+            return;
+        }
+        page.time = Date.now();
+        page.text = xhr.responseText;
+        settle((other) => answerWithTopPage(other.xhr, page.text));
+        pollNotificationFeedsNow(user_id, otherFeedType);
+    });
+    xhr.send(data);
+}
+
+// Legacy's feed scheduler keeps one periodic task per account and feed type. Running it now hands
+// that column the page that just arrived, and restarting its timer keeps it in step with this one
+// instead of fetching again on its own a few seconds later.
+function pollNotificationFeedsNow(user_id, feedType) {
+    try {
+        const task = TD.controller.feedScheduler._getTask(`twitter:${user_id}`, feedType);
+        if (!task || !task.taskId || !task.doTask) return;
+        TD.controller.scheduler.restartPeriodicTask(task.taskId);
+        task.doTask({});
+    } catch (e) {
+        // TD not ready or its internals changed: that column keeps polling on its own timer.
+    }
+}
+
 // Legacy marks a feed as exhausted below a page when a request returns fewer than ten chirps
 // (FeedPoller.EXHAUSTED_API_THRESHOLD in bundle.js) and never asks for older ones again. REST
 // pages were a steady 40, but ours are a GraphQL page minus promoted, muted and unparsable
@@ -1187,6 +1257,45 @@ function relaxLegacyExhaustion() {
         Object.assign(Patched, Original);
         TD.controller.FeedPoller = Patched;
         legacyFeedPollerPatched = true;
+    } catch (e) {
+        // TD isn't loaded yet; the next state load tries again.
+    }
+}
+
+// Legacy's feed scheduler polls each feed type no faster than a floor (in seconds), and stretches
+// that to fit the rate limit X reports. Its scheduler ticks once a second, so a column polls every
+// floor to floor + 1 seconds. Home and notifications come first and bookmarks last:
+// - Home keeps legacy's own 4 s, now that its polls are no longer dropped at random.
+// - Notifications polled every 15 s whatever the rate limit: legacy asks for about_me.json without
+//   a feed type, so it never reads the headers, and the faster_notifications decider caps its 45 s
+//   default at 15 s. Giving it its feed type lets the floor below apply. Mentions reads the same
+//   all.json page and gets the same floor, so neither column trails the other.
+// - Bookmarks waits at least a minute.
+// localStorage can override each floor, in seconds.
+const POLL_FLOORS = {
+    home: ["OTDhomeRefreshSeconds", 4],
+    interactions: ["OTDnotificationsRefreshSeconds", 7],
+    mentions: ["OTDnotificationsRefreshSeconds", 7],
+    bookmarks: ["OTDbookmarksRefreshSeconds", 60],
+};
+
+let legacyPollingTuned = false;
+function tuneLegacyPolling() {
+    if (legacyPollingTuned) return;
+    try {
+        const floors = TD.controller.feedScheduler.FEED_TYPE_TO_MINIMUM_REFRESH_PERIOD;
+        const client = TD.services.TwitterClient.prototype;
+        if (!floors || typeof client.getActivityTimeline !== "function") return;
+        for (const [feedType, [key, fallback]] of Object.entries(POLL_FLOORS)) {
+            const stored = parseFloat(localStorage[key]);
+            floors[feedType] = stored > 0 ? stored : fallback;
+        }
+        const getActivityTimeline = client.getActivityTimeline;
+        client.getActivityTimeline = function (path, since, max, count, success, error, params, feedType) {
+            if (path === "activity/about_me.json" && !feedType) feedType = "interactions";
+            return getActivityTimeline.call(this, path, since, max, count, success, error, params, feedType);
+        };
+        legacyPollingTuned = true;
     } catch (e) {
         // TD isn't loaded yet; the next state load tries again.
     }
@@ -1716,24 +1825,13 @@ const proxyRoutes = [
                 xhr.storage.requested_id = requested;
             } else if (since_id && !topFetchDue(feedKey)) {
                 cursor = timelineCursor(feedKey, since_id, "top");
-                if (cursor) {
-                    xhr.storage.cursor = true;
-                } else {
-                    noteTopFetch(feedKey);
-                }
+                if (!cursor) noteTopFetch(feedKey);
             } else {
                 noteTopFetch(feedKey);
             }
-            if (!timings.home[user_id]) {
-                timings.home[user_id] = 0;
-            }
-            if (Date.now() - timings.home[user_id] < refreshInterval && xhr.storage.cursor && Math.random() > 0.6) {
-                xhr.storage.cancelled = true;
-                return;
-            }
+            // Pacing is left to legacy's scheduler (see POLL_FLOORS).
             xhr.modUrl = homeTimelineUrl(cursor);
             openDeferred(xhr);
-            timings.home[user_id] = Date.now();
         },
         sendHandler: (xhr, data) => {
             if (xhr.storage.cancelled) {
@@ -2336,12 +2434,15 @@ const proxyRoutes = [
             if (!xhr.storage.since_id && xhr.storage.max_id && cursors[`notifications-${user_id}-bottom`]) {
                 cursor = cursors[`notifications-${user_id}-bottom`];
             }
+            xhr.storage.topPage = !cursor;
             xhr.modUrl = notificationsAllUrl(cursor);
             openDeferred(xhr);
         },
         sendHandler: (xhr, data) => {
             if (xhr.storage.cancelled) {
                 emulateResponse(xhr);
+            } else if (xhr.storage.topPage) {
+                sendNotificationsTopPage(xhr, data, "mentions");
             } else {
                 xhr.send(data);
             }
@@ -2359,7 +2460,7 @@ const proxyRoutes = [
                 return xhr.storage.notifications;
             }
             try {
-                const response = JSON.parse(xhr.responseText);
+                const response = JSON.parse(notificationsResponseText(xhr));
                 const entries = response.timeline.instructions.find((i) => i.addEntries).addEntries.entries;
                 const go = response.globalObjects;
                 const notifications = [];
@@ -2489,13 +2590,6 @@ const proxyRoutes = [
     {
         path: "/1.1/statuses/mentions_timeline.json",
         method: "GET",
-        // This reads the same all.json page as the Notifications column (see beforeRequest), so let
-        // legacy's scheduler see only half of the shared quota here and keep both columns' polling
-        // inside the one rate limit.
-        responseHeaderOverride: {
-            "x-rate-limit-limit": (value) => value == null ? value : Math.floor(+value / 2),
-            "x-rate-limit-remaining": (value) => value == null ? value : Math.floor(+value / 2),
-        },
         beforeRequest: (xhr) => {
             const params = new URL(xhr.modUrl).searchParams;
             xhr.storage.since_id = params.get("since_id");
@@ -2517,12 +2611,15 @@ const proxyRoutes = [
             if (!xhr.storage.since_id && xhr.storage.max_id && cursors[`mentions-${user_id}-bottom`]) {
                 cursor = cursors[`mentions-${user_id}-bottom`];
             }
+            xhr.storage.topPage = !cursor;
             xhr.modUrl = notificationsAllUrl(cursor);
             openDeferred(xhr);
         },
         sendHandler: (xhr, data) => {
             if (xhr.storage.cancelled) {
                 emulateResponse(xhr);
+            } else if (xhr.storage.topPage) {
+                sendNotificationsTopPage(xhr, data, "interactions");
             } else {
                 xhr.send(data);
             }
@@ -2536,7 +2633,7 @@ const proxyRoutes = [
         },
         afterRequest: (xhr) => {
             try {
-                const response = JSON.parse(xhr.responseText);
+                const response = JSON.parse(notificationsResponseText(xhr));
                 const entries = response.timeline.instructions.find((i) => i.addEntries).addEntries.entries;
                 const go = response.globalObjects;
                 const tweets = [];
@@ -3766,6 +3863,7 @@ const proxyRoutes = [
             cleanUp();
             keepLegacyPollerCache();
             relaxLegacyExhaustion();
+            tuneLegacyPolling();
             console.log('account state', state);
 
             return state;

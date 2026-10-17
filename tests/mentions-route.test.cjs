@@ -119,9 +119,6 @@ test('a mention from a muted or blocked account is skipped', () => {
     assert.deepEqual(tweets.map(t => t.id_str), ['101']);
 });
 
-test('rate-limit headers are halved for the shared all.json quota and left alone when absent', () => {
-    const override = loadRoute().responseHeaderOverride;
-    assert.equal(override['x-rate-limit-limit']('180'), 90);
-    assert.equal(override['x-rate-limit-remaining']('37'), 18);
-    assert.equal(override['x-rate-limit-remaining'](undefined), undefined);
+test('rate-limit headers reach legacy as they are, since Mentions shares its all.json requests with Notifications', () => {
+    assert.equal(loadRoute().responseHeaderOverride, undefined);
 });
