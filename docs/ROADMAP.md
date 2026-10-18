@@ -3,7 +3,7 @@
 対象: [dimdenGD/OldTweetDeck](https://github.com/dimdenGD/OldTweetDeck) の open Issue 67 件(2026-10-17 に `gh issue list` で取得)。67 件すべてを下のいずれかの節に分類している。
 本フォークは upstream `main`(8bcb4bb)+ 20 コミット(ce8b80e 時点)。
 
-行番号は 92f0be5 時点の `src/interception.js`(Phase 1 の 1-a〜1-e だけは修正前の 97693c7 時点)。Phase 2〜6(f8dc681 / 31dc3bc / 582c857 / ce8b80e / 4d26629 / 017d2a7 / 6522d2c)で変更したため、現在のファイルとは一致しない。`files/bundle.js`・`src/challenge.js`・`src/injection.js` の行番号はそのまま使える(`src/injection.js` は変更なし。`files/bundle.js` は Phase 5 で 3 行を書き換えただけで行数は変わらず、`src/challenge.js` の変更は 92 行より後)。
+行番号は 92f0be5 時点の `src/interception.js`(Phase 1 の 1-a〜1-e だけは修正前の 97693c7 時点)。Phase 2〜7(f8dc681 / 31dc3bc / 582c857 / ce8b80e / 4d26629 / 017d2a7 / 6522d2c / a7c4cc5)で変更したため、現在のファイルとは一致しない。`files/bundle.js`・`src/challenge.js`・`src/injection.js` の行番号はそのまま使える(`src/injection.js` は変更なし。`files/bundle.js` は Phase 5 で 3 行を書き換えただけで行数は変わらず、`src/challenge.js` の変更は 92 行より後)。
 
 分類の基準:
 
@@ -30,6 +30,7 @@
 | #545 / #428 / #197 / #533 / #548 / #505 | ブックマークの混在、アカウント別のデッキ保存、リストメンバー、ユーザー検索 | 582c857 | Phase 4。実機確認は問題なし(2026-10-17) |
 | #550 / #547 / #511 / #518 / #512 / #498 / #501 / #381 / #338 / #106 | 起動・カラムの読み込みが終わらず理由も出ない、デスクトップ通知がすぐ消える、`x.com` のリンクが新規タブ | ce8b80e | Phase 5。実機確認は問題なし(2026-10-17) |
 | (フォークで確認) | 通知カラムと Mentions カラムの更新がずれる、Home の更新間隔がばらつく、フォローのまとめ通知で古いフォロワーが上にあふれる | 4d26629 / 017d2a7 / 6522d2c | Phase 6。5 分間の HAR で間隔と 429 が出ないことは確認(2026-10-18)。2 カラムに同時に出ることの目視と、フォロー通知の実機確認は未了 |
+| (フォークで確認) | Better TweetDeck を併用すると、Home などで認証済みのアカウントのバッジが消え、相互フォローバッジが通知・Mentions にしか出ない | a7c4cc5 | Phase 7。相互の行で認証バッジが隠れるのは BTD の仕様で、BTD のカスタム CSS で対処(2026-10-18 に確認) |
 
 ---
 
@@ -253,6 +254,48 @@ Phase 1 の副作用を先に潰すために扱った。変更は f8dc681(`src/i
 
 ---
 
+## Phase 7: Better TweetDeck との互換(実装済み)
+
+**状態: 実装済み(a7c4cc5)。実機確認も済み(2026-10-18)。** 変更は `src/interception.js`。`node --test tests/*.test.cjs` は 89 件通過。
+
+発端は、README で案内している dimdenGD 版 Better TweetDeck(4.11.3)を併用すると、相互フォローバッジが通知と Mentions にしか出ず、認証済みのアカウントのバッジが消えること(2026-10-18)。BTD のソース(dimdenGD/BetterTweetDeck)と BTD の設定、5 分間の HAR で調べた。upstream の Issue には対応するものが無い。
+
+### 7-a. 調査結果
+
+- フォークの変更で、BTD の読み込みや TweetDeck 内部への差し込みが壊れる箇所は無い。両方が手を入れる次の箇所は両立する: x.com リンクの判定(Phase 5)と BTD の t.co 除去、取得間隔の下限(Phase 6)と BTD のカスタム時刻(30 秒周期の時刻更新タスクを止める)、`window.Notification` の差し替え(Phase 5)、各ルートの URL の組み立てと BTD が `include_entities` 付きの要求に足す ext 系の引数、postMessage。
+- 残課題(未対応):
+  - **Re-draft で長文の後半が消える**: Phase 3(31dc3bc)から、長文は `OTDenableAutoExpand` が `"1"` でない限り省略のまま。「Expand tweet」も表示だけを書き換え、chirp の `text` は省略のまま(`files/bundle.js` 55 行)。BTD の Re-draft は `chirp.text` から作成欄を作り、すぐに元の投稿を削除するので、280 字を超える自分の投稿では後半が失われる。upstream は常に全文にしていたので、フォークで起きるようになった。回避策は `localStorage.OTDenableAutoExpand = '1'`。修正案は、自分のアカウントの投稿だけ常に全文にすること。
+  - **返信制限(conversation control)が効いているか未確認**: BTD は投稿のあとに、旧形式の `POST https://api.x.com/graphql/` で ConversationControlChange(`hb1elGcj6769uT8qVYqtjw`)を送る。OTD にこれを扱うルートは無く、そのまま X に届く。失敗しても BTD は何も表示しないので、制限したつもりの投稿が全員返信可のまま公開されうる。
+  - **BTD が起動しないことがある(コードからの推定)**: BTD は document_idle に設定付きのスクリプトを `<head>` に入れる。OTD が文書を差し替える前に入ると要素ごと消え、BTD は何も出さずに起動しない(リロードで直る)。また BTD の対象は `https://x.com/i/tweetdeck` だけで、`?` 付きの URL では読み込まれない。
+  - BTD の Advanced Mute Engine のフィルタは TweetDeck の設定に入るので、Phase 4 以降はキーワードミュートと同じくログインアカウントごとに保存される。
+
+### 7-b. 相互フォローバッジが通知と Mentions にしか出ない
+
+- 原因: BTD は `user.following` が true の人にだけ `friendships/show.json` を呼び、相互ならアイコンにバッジを付ける。X は GraphQL のユーザーで following / followed_by を `legacy` から `relationship_perspectives` に移した(HAR の Home に出てくる 129 人すべてがこの形で、`legacy.following` を持つ人は 0)。OTD は `legacy` をそのまま v1.1 のユーザーにしていたので、Home・リスト・検索などでは常に「フォローしていない」扱いだった。通知・Mentions の `all.json` のユーザーには `following` があり、そちらでは動いていた。同じ原因で、TweetDeck のツイートのメニューもフォロー中の相手に「Follow @…」と出していた。
+- 対応(a7c4cc5): GraphQL のユーザーに `relationship_perspectives` から `following` / `followed_by` を付ける(`legacy` にすでにあればそのまま)。ツイートの作者、RT・引用の作者、`users/show`、ユーザー検索が対象。
+- BTD の `friendships/show` は起動時に約 50 回増える(HAR の Home で 34 人分)。通知・Mentions の 19 回と合わせても、枠 800 回 / 15 分の 1 割程度。BTD は応答待ちの要求をまとめないので、同じ人の行が複数あると重複する。
+
+### 7-c. 認証済みのアカウントのバッジが消える
+
+- 原因: X は `verified` を立てず、チェックマークは `is_blue_verified` と `verification.verified_type`(Business / Government)で表す。OTD は GraphQL のユーザーで Blue を `verified` にしていた。BTD はこれを TweetDeck 標準のバッジとして扱い、「アイコンの上にバッジを表示」がオンだとカラム内では CSS で隠す。BTD 自身のバッジは `ext_is_blue_verified` / `ext_verified_type` から描くが、この欄は `all.json` のユーザーにしか無い。そのため BTD の「認証バッジ」(アイコン上の認証バッジ)がオフだと、Home などでは認証済みの人にバッジが一つも出なかった(HAR の Home で、ツイートの作者 116 人中 48 人)。
+- Blue なしの Business アカウント(HAR で 1 人)は、`is_blue_verified` だけを見ていたため BTD が無くてもバッジが出ていなかった。
+- 対応(a7c4cc5): GraphQL のユーザーに `ext_is_blue_verified` / `ext_verified_type` を付ける。`verified` は、BTD が動いているとき(`<body>` の `data-btd-ready`)は X の値のまま(現在は全員 false)にして BTD に描かせ、BTD が無いときは Blue・Business・Government のどれでも立てる。通知・Mentions のユーザーにも同じ規則を当てる(BTD が無いとき、通知でも Blue の人に標準のバッジが付く)。HAR の Home では、BTD があるときに BTD が描くバッジが 0 から 49(Blue 46、Business 3)になり、標準のバッジとの二重表示は無い。
+- 副作用: BTD が動いているときは、カラムフィルタの「認証済みユーザーのみ」(`IS_FROM_VERIFIED`)が Blue の人を認証済みと見なさない(通知カラムでは以前から同じ)。
+- 相互の行では、BTD の仕様で認証バッジが隠れる。BTD はアイコンの上にバッジを付けた行で、名前の横の自分のバッジを隠す。相互の判定は `friendships/show` の応答後なので、バッジは一度出てから消える。フォークでは扱わず、BTD の設定のカスタム CSS で残す(2026-10-18 に動作を確認):
+
+```css
+.btd-loaded[btd-badges-top-avatar='true'] .btd-badge.btd-mutual-badge .sprite.verified-badge {
+    display: inline-block;
+}
+```
+
+### Phase 7 のテスト
+
+- 自動テスト(済み): `tests/user-state.test.cjs` に 8 件。following / followed_by が付くこと(RT と引用の作者も)、BTD が無いとき Blue・Business・Government が `verified` になること、BTD があるとき BTD が各チェックマークを一度だけ描くこと、X 自身の `verified` は BTD の有無にかかわらず残ること、`users/show` とユーザー検索も同じであること、`legacy` にすでにある following は残ること、通知・Mentions のユーザーが同じ規則に従うこと。8 件中 6 件は変更前のコードでは失敗する。
+- 実機(2026-10-18): 認証バッジと相互フォローバッジが出ること、カスタム CSS で相互の行にも認証バッジが残ることを確認。
+
+---
+
 ## 対応しない / できないもの
 
 - **X 側の仕様・運用**: #551(Teams からの投稿で凍結)、#529(X Pro が Premium+ 限定)、#522(検索演算子の制限。upstream 作者も X 側と判断)、#506(DM は新 Chat に移行。upstream 作者が「修正不可能」と明言)、#492(アカウント制限。同系統の #469 は close 済み)、#462 / #510 / #259(Teams 招待。X の delegate 挙動)、#517 / #495(レート制限。Phase 1 で無駄なリクエストを減らして緩和はできる。Phase 6 で通知カラムも残り回数に合わせて減速するようにした)
@@ -268,6 +311,6 @@ Phase 1 の副作用を先に潰すために扱った。変更は f8dc681(`src/i
 ## 進め方
 
 - Phase ごとに PR を分け、`tests/` に `node:test` のケースを足す。実行は `node --test tests/*.test.cjs`。
-- Phase 1 から Phase 5 までの実機確認は 2026-10-17 に問題なし。Phase 6 は 2026-10-18 に取得間隔だけ確認し、目視とブックマーク、フォローのまとめ通知(6-d)の確認が残っている。
-- 残りは upstream への PR、Phase 5 で未対応の #321、Phase 6 の残課題(Home のクエリ ID)。
+- Phase 1 から Phase 5 までの実機確認は 2026-10-17 に問題なし。Phase 6 は 2026-10-18 に取得間隔だけ確認し、目視とブックマーク、フォローのまとめ通知(6-d)の確認が残っている。Phase 7 は 2026-10-18 に確認済み。
+- 残りは upstream への PR、Phase 5 で未対応の #321、Phase 6 の残課題(Home のクエリ ID)、Phase 7 の残課題(長文の Re-draft、返信制限の確認)。
 - upstream へは #554(RTL)、#552(Mentions)、Phase 1(92f0be5 / bfcbdd3)の順で PR を出す。起動ハングの修正は limex 氏の #562 が未マージで close されているので、出すならクレジット付きで出し直す。
