@@ -363,6 +363,42 @@ function tweetHidden(tweet) {
     return false;
 }
 
+// Better TweetDeck marks <body> data-btd-ready once it runs. It draws its own Blue, Business and
+// Government badges from the v1.1 ext_is_blue_verified / ext_verified_type fields.
+function betterTweetDeckRunning() {
+    try {
+        return document.body.getAttribute("data-btd-ready") === "true";
+    } catch (e) {
+        return false;
+    }
+}
+
+// X no longer sets `verified`: a checkmark is is_blue_verified or a verified_type (Business,
+// Government). Legacy only draws `verified`, so a checkmark becomes `verified` for it to draw.
+// Better TweetDeck draws the checkmark itself from the ext_ fields, so with it running `verified`
+// stays what X says: otherwise both draw one, and when BTD puts badges on avatars it hides legacy's
+// in columns, which left these accounts with no badge at all there.
+function markVerified(user) {
+    if (!user || user.verified) return;
+    if ((user.ext_is_blue_verified || user.ext_verified_type) && !betterTweetDeckRunning()) user.verified = true;
+}
+
+// A GraphQL user's checkmark and follow state, in the v1.1 fields legacy and Better TweetDeck read.
+// X moved following / followed_by out of `legacy` into relationship_perspectives. Without them
+// legacy offers "Follow" for accounts already followed, and BTD never looks for mutuals.
+function applyGraphUserState(user, result) {
+    const relationship = result?.relationship_perspectives;
+    if (relationship) {
+        if (!("following" in user)) user.following = !!relationship.following;
+        if (!("followed_by" in user)) user.followed_by = !!relationship.followed_by;
+    }
+    user.ext_is_blue_verified = !!result?.is_blue_verified;
+    if (result?.verification?.verified_type) user.ext_verified_type = result.verification.verified_type;
+    if (result?.is_blue_verified) user.verified_type = "Blue";
+    if (result?.verification?.verified) user.verified = true;
+    markVerified(user);
+}
+
 function isPromoted(entry) {
     const id = entry?.entryId || "";
     if (id.includes("promoted")) return true;
@@ -448,10 +484,6 @@ function parseTweet(res, options) {
         tweet.user = result.legacy || {};
         tweet.user.id = +tweet.user_id_str;
         tweet.user.id_str = tweet.user_id_str;
-        if (result.is_blue_verified) {
-            tweet.user.verified = true;
-            tweet.user.verified_type = "Blue";
-        }
         if(!tweet.user.profile_image_url && result?.avatar?.image_url) {
             tweet.user.profile_image_url = result.avatar.image_url;
             tweet.user.profile_image_url_https = tweet.user.profile_image_url.replace("http://", "https://");
@@ -480,9 +512,7 @@ function parseTweet(res, options) {
         if(result?.location?.location) {
             tweet.user.location = res.core.user_results.result.location.location;
         }
-        if(result?.verification?.verified) {
-            tweet.user.verified = true;
-        }
+        applyGraphUserState(tweet.user, result);
 
         if (tweet.retweeted_status_result?.result) {
             let result = tweet.retweeted_status_result.result;
@@ -545,14 +575,7 @@ function parseTweet(res, options) {
                     if(user_result?.location?.location) {
                         result.legacy.quoted_status.user.location = user_result.location.location;
                     }
-                    if(user_result?.verification?.verified) {
-                        result.legacy.quoted_status.user.verified = true;
-                    }
-                    
-                    if (user_result.is_blue_verified) {
-                        result.legacy.quoted_status.user.verified = true;
-                        result.legacy.quoted_status.user.verified_type = "Blue";
-                    }
+                    applyGraphUserState(result.legacy.quoted_status.user, user_result);
                 } else {
                     console.warn("No retweeted quoted status", result);
                 }
@@ -595,14 +618,7 @@ function parseTweet(res, options) {
                 if(user_result?.location?.location) {
                     tweet.retweeted_status.user.location = result.core.user_results.result.location.location;
                 }
-                if(user_result?.verification?.verified) {
-                    tweet.retweeted_status.user.verified = true;
-                }
-
-                if (result.core.user_results.result.is_blue_verified) {
-                    tweet.retweeted_status.user.verified = true;
-                    tweet.retweeted_status.user.verified_type = "Blue";
-                }
+                applyGraphUserState(tweet.retweeted_status.user, user_result);
                 tweet.retweeted_status.ext = {};
                 if (result.views) {
                     tweet.retweeted_status.ext.views = { r: { ok: { count: +result.views.count } } };
@@ -689,13 +705,7 @@ function parseTweet(res, options) {
                         if(user_result?.location?.location) {
                             tweet.quoted_status.user.location = user_result.location.location;
                         }
-                        if(user_result?.verification?.verified) {
-                            tweet.quoted_status.user.verified = true;
-                        }
-                        if (user_result.is_blue_verified) {
-                            tweet.quoted_status.user.verified = true;
-                            tweet.quoted_status.user.verified_type = "Blue";
-                        }
+                        applyGraphUserState(tweet.quoted_status.user, user_result);
                         tweet.quoted_status.ext = {};
                         if (result.views) {
                             tweet.quoted_status.ext.views = { r: { ok: { count: +result.views.count } } };
@@ -1503,6 +1513,12 @@ function notificationTweet(go, tweetId) {
     return tweet;
 }
 
+// all.json users are v1.1 users: they already carry following / followed_by and the ext_ checkmark
+// fields, with `verified` false for every checkmark X gives out now.
+function markNotificationUsers(go) {
+    for (const user of Object.values(go?.users || {})) markVerified(user);
+}
+
 function notificationPollers(user_id) {
     const pollers = [];
     try {
@@ -1639,7 +1655,7 @@ function legacyUserFromGraph(result) {
         created_at: legacy.created_at || result.core?.created_at || "",
     });
     if (!user.profile_image_url) user.profile_image_url = image.replace("https://", "http://");
-    if (result.is_blue_verified || result.verification?.verified) user.verified = true;
+    applyGraphUserState(user, result);
     if (result.privacy?.protected) user.protected = true;
     if (result.relationship_perspectives?.muting) user.muting = true;
     if (result.relationship_perspectives?.blocking) user.blocking = true;
@@ -2496,6 +2512,7 @@ const proxyRoutes = [
                 const response = JSON.parse(notificationsResponseText(xhr));
                 const entries = response.timeline.instructions.find((i) => i.addEntries).addEntries.entries;
                 const go = response.globalObjects;
+                markNotificationUsers(go);
                 const notifications = [];
                 const shouldDeliver = notificationDeliveryFilter(xhr.storage.user_id);
                 const poll = Boolean(xhr.storage.since_id);
@@ -2673,6 +2690,7 @@ const proxyRoutes = [
                 const response = JSON.parse(notificationsResponseText(xhr));
                 const entries = response.timeline.instructions.find((i) => i.addEntries).addEntries.entries;
                 const go = response.globalObjects;
+                markNotificationUsers(go);
                 const tweets = [];
                 for(let entry of entries) {
                     if(entry.entryId.startsWith("notification-")) {
@@ -3198,6 +3216,7 @@ const proxyRoutes = [
                     }
                     let user = result.legacy;
                     user.id_str = result.rest_id;
+                    applyGraphUserState(user, result);
                     res.push(user);
                 }
             }
