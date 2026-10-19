@@ -1,9 +1,9 @@
 # 修正ロードマップ(upstream Issue 棚卸し: 2026-10-17 時点)
 
 対象: [dimdenGD/OldTweetDeck](https://github.com/dimdenGD/OldTweetDeck) の open Issue 67 件(2026-10-17 に `gh issue list` で取得)。67 件すべてを下のいずれかの節に分類している。
-本フォークは upstream `main`(8bcb4bb)+ 20 コミット(ce8b80e 時点)。
+本フォークは upstream `main`(8bcb4bb)+ 29 コミット(8d58466 時点)。
 
-行番号は 92f0be5 時点の `src/interception.js`(Phase 1 の 1-a〜1-e だけは修正前の 97693c7 時点)。Phase 2〜7(f8dc681 / 31dc3bc / 582c857 / ce8b80e / 4d26629 / 017d2a7 / 6522d2c / a7c4cc5)で変更したため、現在のファイルとは一致しない。`files/bundle.js`・`src/challenge.js`・`src/injection.js` の行番号はそのまま使える(`src/injection.js` は変更なし。`files/bundle.js` は Phase 5 で 3 行を書き換えただけで行数は変わらず、`src/challenge.js` の変更は 92 行より後)。
+行番号は 92f0be5 時点の `src/interception.js`(Phase 1 の 1-a〜1-e だけは修正前の 97693c7 時点)。Phase 2〜8(f8dc681 / 31dc3bc / 582c857 / ce8b80e / 4d26629 / 017d2a7 / 6522d2c / a7c4cc5 / 8d58466)で変更したため、現在のファイルとは一致しない。`files/bundle.js`・`src/challenge.js`・`src/injection.js` の行番号はそのまま使える(`src/injection.js` は変更なし。`files/bundle.js` は Phase 5 で 3 行、Phase 8 で 20 行を同一行内で書き換えただけで行数は変わらず、`src/challenge.js` の変更は 92 行より後)。
 
 分類の基準:
 
@@ -31,6 +31,7 @@
 | #550 / #547 / #511 / #518 / #512 / #498 / #501 / #381 / #338 / #106 | 起動・カラムの読み込みが終わらず理由も出ない、デスクトップ通知がすぐ消える、`x.com` のリンクが新規タブ | ce8b80e | Phase 5。実機確認は問題なし(2026-10-17) |
 | (フォークで確認) | 通知カラムと Mentions カラムの更新がずれる、Home の更新間隔がばらつく、フォローのまとめ通知で古いフォロワーが上にあふれる | 4d26629 / 017d2a7 / 6522d2c | Phase 6。5 分間の HAR で間隔と 429 が出ないことは確認(2026-10-18)。2 カラムに同時に出ることの目視と、フォロー通知の実機確認は未了 |
 | (フォークで確認) | Better TweetDeck を併用すると、Home などで認証済みのアカウントのバッジが消え、相互フォローバッジが通知・Mentions にしか出ない | a7c4cc5 | Phase 7。相互の行で認証バッジが隠れるのは BTD の仕様で、BTD のカスタム CSS で対処(2026-10-18 に確認) |
+| (機能要望) | カラム設定「Tweet authors」に、相互フォローの相手だけを表示する選択肢が無い | 8d58466 | Phase 8。legacy が `followed_by` を捨てていたので `TwitterUser` に持たせ、「verified users」と同じ作りで「mutual follows」を追加。検索・イベントカラムには出さない。実機確認は未了 |
 
 ---
 
@@ -296,6 +297,44 @@ Phase 1 の副作用を先に潰すために扱った。変更は f8dc681(`src/i
 
 ---
 
+## Phase 8: カラムフィルタ「相互フォロー」(実装済み)
+
+**状態: 実装済み(8d58466)。実機確認は未了。** 変更は `files/bundle.js`(20 行を同一行内で書き換え。行数は 76373 のまま)と `tests/mutual-follows.test.cjs`(新規)、`tests/user-state.test.cjs`(1 件追加)。`node --test tests/*.test.cjs` は 97 件通過。
+
+発端は、Home カラムを相互フォローの相手だけに絞りたいという要望(フォーク独自。upstream の Issue には対応するものが無い)。カラム設定「Tweet authors」(`TD.vo.UserFilter`、`files/bundle.js` 30314-30426)でクライアント側に効くのは「specific user」(`TD.vo.Filter.SENDER`)と「verified users」(`TD.vo.Filter.IS_FROM_VERIFIED`)だけで、「users I follow」は通知・Mentions・Followers 限定のサーバ側フラグ(`filters=following`)のため、フォークのルートでは何もしない。Phase 7(a7c4cc5)で GraphQL のユーザーに `following` / `followed_by` を付けたのでデータは Home にも届いていたが、legacy の `TwitterUser.fromJSONObject`(40667-40726)は `following` しか読まず(40699)、`followed_by` を捨てていた。
+
+### 8-a. 仕組み
+
+- `TwitterUser` に `followedBy`(40699。GraphQL 形式の 40764 も)と `isMutualFollow()`(40801)を足した。`Boolean(following && followedBy)` で常に boolean。
+- `TD.vo.UserFilter.FROM_MUTUAL = "mutual"`(30321)。`setFrom` の from_name クリア(30326)、`getSummaryText` の「by mutual follows」(30387)、`getFilters` での `IS_FROM_MUTUAL` 生成(30423)。`getQueryString`(30345-30358)は変えない: 検索演算子が無い。
+- `TD.vo.Filter.IS_FROM_MUTUAL = "mutual"`(29744)。コンストラクタでは verified と同じ `exact = !0, filterTarget = "parent"`(29722): 通知の「いいね」などでは対象のツイートではなく行動した人を見る(`_getFilterTarget` 29829)。`pass` は `e.isFromMutualUser()` を `_testBoolean` に渡す(29789)。
+- チャープ側: `ChirpBase.isFromMutualUser` は false(37465)。`TwitterStatus.isFromMutualUser`(38410)は RT した人(`this.user`)か元の作者(`getMainTweet().user`)のどちらかが相互、または自分(`isMe()`。カラムのアカウント基準)。`TwitterAction.isFromMutualUser`(41422)は `getCreator()` を見る。
+- `_testBoolean`(29846-29852)は boolean 以外を渡すとフィルタを素通りさせる(lodash `isBoolean`)。そのため判定は厳密な boolean を返し、`relationship_perspectives` の無いユーザー(`followed_by` が undefined)は「相互でない」として隠れる。
+- 引用ツイート: `TwitterStatus.passFilters`(38217-38222)はカラムのフィルタを引用先にも当てるため、verified と同じままだと相互の人が非相互の人を引用した投稿が隠れる。引用先には `IS_FROM_MUTUAL` だけ当てない(38220)。ミュートと他のカラムフィルタは従来どおり引用先にも効く。「specific user」「verified users」の挙動は変えていない。
+- ヘッダの「Filtering by」アイコンは `hasActiveUserFilters`(29626)に `"mutual"` を足して出す(`getQueryString()` が空のため)。
+- 選択肢は `getTweetsFromOptions`(60424-60456)に第 3 引数 `withMutualFollows` で足し(60420 / 60424 / 60454 / 60566)、`attachColumnFilters`(14691)で `withMutualFollows: !t`(`t` = 検索またはイベントカラム)として渡す。検索・イベントカラムでは `updateSearchFeedFilter`(29568-29580)がクエリ文字列の変化しか保存せず、`loadFilters`(29522-29526)が読む `model.getFilters()` も設定されないので、出しても選択が戻るだけになる。Home だけにするなら、2826 に `canFilterByUsersIFollow` と同じ形で `col_timeline` / `col_home` を見る関数を足し、14691 をそれに差し替える。
+- 選択を変えると `loadFilters` がフィルタ id の違いを検知して `reloadTweets()`(カラムを空にして再取得)するので、表示中のカラムにも即反映される。保存は `filters.user.from_type` としてそのまま `OTDcolumns:<loginId>` に入る(`src/interception.js` の emulate ルートは変更なし)。
+- Better TweetDeck の Advanced Mute Engine は `TD.vo.Filter.prototype.pass` を包んで元を `_pass` に退避し、AME 以外の種類は元に任せるので併用できる。BTD の相互判定(`friendships/show`)とは独立。
+
+### 8-b. 判定の選び方(代替案)
+
+- RT: RT した人か元の作者のどちらか(「specific user」の `getSenders` と同じ考え方)。verified と同じく元の作者だけにするなら 38410 の `e.isMe()` と `e.isMutualFollow()` の項を外す。RT した人だけにするなら `t` 側の項を外す。
+- 自分の投稿: `isMe()` で通す(X は自分に `following: false` を返す)。隠すなら `isMe()` の項を外す。
+- follow 状態が不明な人: 隠す。通すと `_testBoolean` の素通りと区別が付かなくなる。
+
+### 8-c. 残課題
+
+- 「users I follow」(`FROM_FOLLOWING`)はフォークでは無効のまま。同じ作りで `following` を見るクライアント側フィルタに置き換えられる。
+- `followedBy` はアプリ内のフォロー・解除では更新されない(`follow()` / `unfollow()` は `following` だけ変える)。相手側の変化は再取得まで反映されない。
+- 実機確認(下記)が未了。
+
+### Phase 8 のテスト
+
+- 自動テスト(済み): `tests/mutual-follows.test.cjs` に 7 件。定数・`pass` の分岐・要約文・ヘッダ判定・`followedBy` の読み込み・フォームの配線が bundle.js にあること、`isMutualFollow()` が両方 true のときだけ true で常に boolean であること、ツイートは作者か RT した人が相互なら通り自分の投稿も通ること、通知は行動した人で判定し他のチャープは通らないこと、`pass` が true を通し false を落とし boolean 以外を素通りさせること(厳密な boolean が必要な理由)、引用先には `IS_FROM_MUTUAL` だけ当てないこと、bundle.js の行数が 76373 のままであること。`tests/user-state.test.cjs` に 1 件: `relationship_perspectives` の無いユーザーは `following` / `followed_by` が undefined のまま(= 隠れる側)。
+- 実機(未了): `localStorage.OTDalwaysUseLocalFiles = '1'` で、Home の Tweet authors に「mutual follows」が出ること(verified users の次)、選ぶと相互の人・自分・相互が絡む RT だけになり、要約が「by mutual follows」になりヘッダに Filtering by のアイコンが出ること、相互の人が非相互の人を引用した投稿が残ること、リロード後も残ること(`OTDcolumns` の `filters.user.from_type`)、通知・Mentions・リストでも効き検索カラムには出ないこと、BTD 併用時に相互バッジと結果が一致すること。
+
+---
+
 ## 対応しない / できないもの
 
 - **X 側の仕様・運用**: #551(Teams からの投稿で凍結)、#529(X Pro が Premium+ 限定)、#522(検索演算子の制限。upstream 作者も X 側と判断)、#506(DM は新 Chat に移行。upstream 作者が「修正不可能」と明言)、#492(アカウント制限。同系統の #469 は close 済み)、#462 / #510 / #259(Teams 招待。X の delegate 挙動)、#517 / #495(レート制限。Phase 1 で無駄なリクエストを減らして緩和はできる。Phase 6 で通知カラムも残り回数に合わせて減速するようにした)
@@ -311,6 +350,6 @@ Phase 1 の副作用を先に潰すために扱った。変更は f8dc681(`src/i
 ## 進め方
 
 - Phase ごとに PR を分け、`tests/` に `node:test` のケースを足す。実行は `node --test tests/*.test.cjs`。
-- Phase 1 から Phase 5 までの実機確認は 2026-10-17 に問題なし。Phase 6 は 2026-10-18 に取得間隔だけ確認し、目視とブックマーク、フォローのまとめ通知(6-d)の確認が残っている。Phase 7 は 2026-10-18 に確認済み。
-- 残りは upstream への PR、Phase 5 で未対応の #321、Phase 6 の残課題(Home のクエリ ID)、Phase 7 の残課題(長文の Re-draft、返信制限の確認)。
+- Phase 1 から Phase 5 までの実機確認は 2026-10-17 に問題なし。Phase 6 は 2026-10-18 に取得間隔だけ確認し、目視とブックマーク、フォローのまとめ通知(6-d)の確認が残っている。Phase 7 は 2026-10-18 に確認済み。Phase 8(相互フォローのフィルタ)は実機確認が未了。
+- 残りは upstream への PR、Phase 5 で未対応の #321、Phase 6 の残課題(Home のクエリ ID)、Phase 7 の残課題(長文の Re-draft、返信制限の確認)、Phase 8 の残課題(「users I follow」のクライアント側への置き換え)。
 - upstream へは #554(RTL)、#552(Mentions)、Phase 1(92f0be5 / bfcbdd3)の順で PR を出す。起動ハングの修正は limex 氏の #562 が未マージで close されているので、出すならクレジット付きで出し直す。
