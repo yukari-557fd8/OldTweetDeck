@@ -14688,7 +14688,7 @@ document.body.addEventListener("click", function (e) {
                                       withFromList: t,
                                       withUsersIFollow: o.default.canFilterByUsersIFollow(
                                           this.column
-                                      ),
+                                      ), withMutualFollows: !t,
                                       withActionFilter: o.default.isActionsColumn(this.column),
                                       withEngagementFilter: t,
                                       withPeriscopeFilter: t,
@@ -29623,7 +29623,7 @@ document.body.addEventListener("click", function (e) {
             (TD.vo.Column.prototype.hasActiveUserFilters = function () {
                 var e = this.getSearchFilter(),
                     t = e.user.getQueryString(),
-                    i = "following" === e.user.from_type;
+                    i = "following" === e.user.from_type || "mutual" === e.user.from_type;
                 return Boolean(t || i);
             }),
             (TD.vo.Column.prototype.hasActiveActionFilters = function () {
@@ -29719,7 +29719,7 @@ document.body.addEventListener("click", function (e) {
                 case TD.vo.Filter.IS_RETWEET:
                     this.exact = !0;
                     break;
-                case TD.vo.Filter.IS_FROM_VERIFIED:
+                case TD.vo.Filter.IS_FROM_VERIFIED: case TD.vo.Filter.IS_FROM_MUTUAL:
                 case TD.vo.Filter.CHIRP_TYPE:
                     (this.exact = !0), (this.filterTarget = "parent");
             }
@@ -29741,7 +29741,7 @@ document.body.addEventListener("click", function (e) {
             (TD.vo.Filter.HAS_VINE = "has_vine"),
             (TD.vo.Filter.HAS_MEDIA = "has_media"),
             (TD.vo.Filter.HAS_LINK = "has_link"),
-            (TD.vo.Filter.IS_FROM_VERIFIED = "verified"),
+            (TD.vo.Filter.IS_FROM_VERIFIED = "verified"), (TD.vo.Filter.IS_FROM_MUTUAL = "mutual"),
             (TD.vo.Filter.CHIRP_TYPE = "chirp_type"),
             (TD.vo.Filter.LOCATION = "location"),
             (TD.vo.Filter.SINCE_TIME = "since_time"),
@@ -29786,7 +29786,7 @@ document.body.addEventListener("click", function (e) {
                     case TD.vo.Filter.IS_RETWEET:
                         return this._testBoolean(e.isRetweetedStatus());
                     case TD.vo.Filter.IS_FROM_VERIFIED:
-                        return this._testBoolean(e.isFromVerifiedUser());
+                        return this._testBoolean(e.isFromVerifiedUser()); case TD.vo.Filter.IS_FROM_MUTUAL: return this._testBoolean(e.isFromMutualUser());
                     case TD.vo.Filter.HAS_IMAGE:
                         return this._testBoolean(e.hasImage());
                     case TD.vo.Filter.HAS_VIDEO:
@@ -30318,12 +30318,12 @@ document.body.addEventListener("click", function (e) {
             (TD.vo.UserFilter.FROM_USER = "user"),
             (TD.vo.UserFilter.FROM_VERIFIED = "verified"),
             (TD.vo.UserFilter.FROM_LIST = "list"),
-            (TD.vo.UserFilter.FROM_FOLLOWING = "following"),
+            (TD.vo.UserFilter.FROM_FOLLOWING = "following"), (TD.vo.UserFilter.FROM_MUTUAL = "mutual"),
             (TD.vo.UserFilter.prototype.from_type = null),
             (TD.vo.UserFilter.prototype.from_name = null),
             (TD.vo.UserFilter.prototype.mention_name = null),
             (TD.vo.UserFilter.prototype.setFrom = function (e, t) {
-                (t && e !== TD.vo.UserFilter.FROM_VERIFIED && e !== TD.vo.UserFilter.FROM_ALL) ||
+                (t && e !== TD.vo.UserFilter.FROM_VERIFIED && e !== TD.vo.UserFilter.FROM_ALL && e !== TD.vo.UserFilter.FROM_MUTUAL) ||
                     (t = ""),
                     (this.from_type = e),
                     (this.from_name = TD.util.deMentionify(t));
@@ -30384,7 +30384,7 @@ document.body.addEventListener("click", function (e) {
                         );
                         break;
                     case TD.vo.UserFilter.FROM_FOLLOWING:
-                        e.push((0, r.default)("by users I follow"));
+                        e.push((0, r.default)("by users I follow")); break; case TD.vo.UserFilter.FROM_MUTUAL: e.push((0, r.default)("by mutual follows"));
                 }
                 return (
                     this.mention_name &&
@@ -30420,7 +30420,7 @@ document.body.addEventListener("click", function (e) {
                         (e = new TD.vo.Filter(TD.vo.Filter.SENDER, this.from_name, !0)), t.push(e);
                         break;
                     case TD.vo.UserFilter.FROM_VERIFIED:
-                        (e = new TD.vo.Filter(TD.vo.Filter.IS_FROM_VERIFIED, !0, !0)), t.push(e);
+                        (e = new TD.vo.Filter(TD.vo.Filter.IS_FROM_VERIFIED, !0, !0)), t.push(e); break; case TD.vo.UserFilter.FROM_MUTUAL: (e = new TD.vo.Filter(TD.vo.Filter.IS_FROM_MUTUAL, !0, !0)), t.push(e);
                 }
                 return t;
             });
@@ -37462,7 +37462,7 @@ document.body.addEventListener("click", function (e) {
             }),
             (TD.services.ChirpBase.prototype.isFromVerifiedUser = function () {
                 return !1;
-            }),
+            }), (TD.services.ChirpBase.prototype.isFromMutualUser = function () { return !1; }),
             (TD.services.ChirpBase.msFudge = 0),
             (TD.services.ChirpBase.prototype.fudgeCreatedTime = function (e) {
                 var t = TD.services.ChirpBase.msFudge;
@@ -38217,7 +38217,7 @@ document.body.addEventListener("click", function (e) {
             (TD.services.TwitterStatus.prototype.passFilters = function (e) {
                 return (
                     TD.controller.filterManager.pass(this, e) &&
-                    (!this.quotedTweet || TD.controller.filterManager.pass(this.quotedTweet, e))
+                    (!this.quotedTweet || TD.controller.filterManager.pass(this.quotedTweet, e && e.filter(function (t) { return t.type !== TD.vo.Filter.IS_FROM_MUTUAL; })))
                 );
             }),
             (TD.services.TwitterStatus.prototype.getFilterableText = function () {
@@ -38407,7 +38407,7 @@ document.body.addEventListener("click", function (e) {
             }),
             (TD.services.TwitterStatus.prototype.isFromVerifiedUser = function () {
                 return this.getMainTweet().user.isVerified;
-            }),
+            }), (TD.services.TwitterStatus.prototype.isFromMutualUser = function () { var e = this.user, t = this.getMainTweet().user; return e.isMe() || t.isMe() || e.isMutualFollow() || t.isMutualFollow(); }),
             (TD.services.TwitterStatus.prototype.hasImage = function () {
                 return (
                     null === this._hasImage &&
@@ -40696,7 +40696,7 @@ document.body.addEventListener("click", function (e) {
                     (this.isVerified = e.verified),
                     (this.isTranslator = e.is_translator),
                     (this.isBadged = Boolean(e.verified || e.is_translator)),
-                    (this.following = e.following),
+                    (this.following = e.following), (this.followedBy = e.followed_by),
                     (this.lang = e.lang),
                     (this.withheldScope = e.withheld_scope),
                     (this.profileColor = e.profile_link_color),
@@ -40761,7 +40761,7 @@ document.body.addEventListener("click", function (e) {
                     (this.isVerified = r.verified),
                     (this.isTranslator = r.is_translator),
                     (this.isBadged = Boolean(r.verified || r.is_translator)),
-                    (this.following = r.following),
+                    (this.following = r.following), (this.followedBy = r.followed_by),
                     (this.lang = r.lang),
                     (this.muting = r.muting),
                     (this.blocking = r.blocking),
@@ -40798,7 +40798,7 @@ document.body.addEventListener("click", function (e) {
             }),
             (TD.services.TwitterUser.prototype.isMe = function () {
                 return this.account.getUserID() == this.id;
-            }),
+            }), (TD.services.TwitterUser.prototype.isMutualFollow = function () { return Boolean(this.following && this.followedBy); }),
             (TD.services.TwitterUser.prototype.isBlockingOrMuting = function () {
                 return this.blocking || this.muting;
             }),
@@ -41419,7 +41419,7 @@ document.body.addEventListener("click", function (e) {
             }),
             (TD.services.TwitterAction.prototype.isFromVerifiedUser = function () {
                 return this.getCreator().isVerified;
-            }),
+            }), (TD.services.TwitterAction.prototype.isFromMutualUser = function () { var e = this.getCreator(); return e.isMe() || e.isMutualFollow(); }),
             (TD.services.TwitterAction.prototype.getTargetUsers = function () {
                 throw new Error("TwitterAction.getTargetUsers not implemented");
             });
@@ -60417,11 +60417,11 @@ document.body.addEventListener("click", function (e) {
                 isHiddenClass: "is-hidden",
                 renderOptions: {
                     withFromList: !1,
-                    withUsersIFollow: !1,
+                    withUsersIFollow: !1, withMutualFollows: !1,
                 },
                 searchFilter: null,
             }),
-                (this.getTweetsFromOptions = function (e, t) {
+                (this.getTweetsFromOptions = function (e, t, u) {
                     var i = [
                         {
                             value: TD.vo.UserFilter.FROM_ALL,
@@ -60451,7 +60451,7 @@ document.body.addEventListener("click", function (e) {
                                 value: TD.vo.UserFilter.FROM_FOLLOWING,
                                 title: (0, n.default)("users I follow"),
                             }),
-                        i
+                        u && i.push({ value: TD.vo.UserFilter.FROM_MUTUAL, title: (0, n.default)("mutual follows") }), i
                     );
                 }),
                 (this.getMentioningOptions = function () {
@@ -60563,7 +60563,7 @@ document.body.addEventListener("click", function (e) {
                     var e, t, i;
                     (this.tweetsFromOptions = this.getTweetsFromOptions(
                         this.attr.renderOptions.withFromList,
-                        this.attr.renderOptions.withUsersIFollow
+                        this.attr.renderOptions.withUsersIFollow, this.attr.renderOptions.withMutualFollows
                     )),
                         (this.mentioningOptions = this.getMentioningOptions()),
                         (this.myAccounts = this.getMyAccounts());

@@ -131,6 +131,14 @@ test('a following flag legacy already has is kept', () => {
     assert.equal(load().parseTweet(tweetResult('100', author)).user.following, true);
 });
 
+test('a user X sends without relationship_perspectives has no follow state, so a mutual filter hides them', () => {
+    const author = graphUser('1', { following: true, followedBy: true });
+    delete author.relationship_perspectives;
+    const tweet = load().parseTweet(tweetResult('100', author));
+    assert.equal(tweet.user.following, undefined);
+    assert.equal(tweet.user.followed_by, undefined);
+});
+
 // all.json users are v1.1 users: following and ext_ fields are there, `verified` is false.
 function allJsonPage(entries, users, tweets = []) {
     return JSON.stringify({
