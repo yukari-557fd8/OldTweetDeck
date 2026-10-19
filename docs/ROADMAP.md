@@ -31,7 +31,7 @@
 | #550 / #547 / #511 / #518 / #512 / #498 / #501 / #381 / #338 / #106 | 起動・カラムの読み込みが終わらず理由も出ない、デスクトップ通知がすぐ消える、`x.com` のリンクが新規タブ | ce8b80e | Phase 5。実機確認は問題なし(2026-10-17) |
 | (フォークで確認) | 通知カラムと Mentions カラムの更新がずれる、Home の更新間隔がばらつく、フォローのまとめ通知で古いフォロワーが上にあふれる | 4d26629 / 017d2a7 / 6522d2c | Phase 6。5 分間の HAR で間隔と 429 が出ないことは確認(2026-10-18)。2 カラムに同時に出ることの目視と、フォロー通知の実機確認は未了 |
 | (フォークで確認) | Better TweetDeck を併用すると、Home などで認証済みのアカウントのバッジが消え、相互フォローバッジが通知・Mentions にしか出ない | a7c4cc5 | Phase 7。相互の行で認証バッジが隠れるのは BTD の仕様で、BTD のカスタム CSS で対処(2026-10-18 に確認) |
-| (機能要望) | カラム設定「Tweet authors」に、相互フォローの相手だけを表示する選択肢が無い | 8d58466 | Phase 8。legacy が `followed_by` を捨てていたので `TwitterUser` に持たせ、「verified users」と同じ作りで「mutual follows」を追加。検索・イベントカラムには出さない。実機確認は未了 |
+| (機能要望) | カラム設定「Tweet authors」に、相互フォローの相手だけを表示する選択肢が無い | 8d58466 | Phase 8。legacy が `followed_by` を捨てていたので `TwitterUser` に持たせ、「verified users」と同じ作りで「mutual follows」を追加。検索・イベントカラムには出さない。実機確認は問題なし(2026-10-19) |
 
 ---
 
@@ -297,9 +297,9 @@ Phase 1 の副作用を先に潰すために扱った。変更は f8dc681(`src/i
 
 ---
 
-## Phase 8: カラムフィルタ「相互フォロー」(実装済み)
+## Phase 8: カラムフィルタ「相互フォロー」(完了)
 
-**状態: 実装済み(8d58466)。実機確認は未了。** 変更は `files/bundle.js`(20 行を同一行内で書き換え。行数は 76373 のまま)と `tests/mutual-follows.test.cjs`(新規)、`tests/user-state.test.cjs`(1 件追加)。`node --test tests/*.test.cjs` は 97 件通過。
+**状態: 完了。実機確認も問題なし(2026-10-19)。** 変更は 8d58466。`files/bundle.js`(20 行を同一行内で書き換え。行数は 76373 のまま)と `tests/mutual-follows.test.cjs`(新規)、`tests/user-state.test.cjs`(1 件追加)。`node --test tests/*.test.cjs` は 97 件通過。
 
 発端は、Home カラムを相互フォローの相手だけに絞りたいという要望(フォーク独自。upstream の Issue には対応するものが無い)。カラム設定「Tweet authors」(`TD.vo.UserFilter`、`files/bundle.js` 30314-30426)でクライアント側に効くのは「specific user」(`TD.vo.Filter.SENDER`)と「verified users」(`TD.vo.Filter.IS_FROM_VERIFIED`)だけで、「users I follow」は通知・Mentions・Followers 限定のサーバ側フラグ(`filters=following`)のため、フォークのルートでは何もしない。Phase 7(a7c4cc5)で GraphQL のユーザーに `following` / `followed_by` を付けたのでデータは Home にも届いていたが、legacy の `TwitterUser.fromJSONObject`(40667-40726)は `following` しか読まず(40699)、`followed_by` を捨てていた。
 
@@ -326,12 +326,11 @@ Phase 1 の副作用を先に潰すために扱った。変更は f8dc681(`src/i
 
 - 「users I follow」(`FROM_FOLLOWING`)はフォークでは無効のまま。同じ作りで `following` を見るクライアント側フィルタに置き換えられる。
 - `followedBy` はアプリ内のフォロー・解除では更新されない(`follow()` / `unfollow()` は `following` だけ変える)。相手側の変化は再取得まで反映されない。
-- 実機確認(下記)が未了。
 
 ### Phase 8 のテスト
 
 - 自動テスト(済み): `tests/mutual-follows.test.cjs` に 7 件。定数・`pass` の分岐・要約文・ヘッダ判定・`followedBy` の読み込み・フォームの配線が bundle.js にあること、`isMutualFollow()` が両方 true のときだけ true で常に boolean であること、ツイートは作者か RT した人が相互なら通り自分の投稿も通ること、通知は行動した人で判定し他のチャープは通らないこと、`pass` が true を通し false を落とし boolean 以外を素通りさせること(厳密な boolean が必要な理由)、引用先には `IS_FROM_MUTUAL` だけ当てないこと、bundle.js の行数が 76373 のままであること。`tests/user-state.test.cjs` に 1 件: `relationship_perspectives` の無いユーザーは `following` / `followed_by` が undefined のまま(= 隠れる側)。
-- 実機(未了): `localStorage.OTDalwaysUseLocalFiles = '1'` で、Home の Tweet authors に「mutual follows」が出ること(verified users の次)、選ぶと相互の人・自分・相互が絡む RT だけになり、要約が「by mutual follows」になりヘッダに Filtering by のアイコンが出ること、相互の人が非相互の人を引用した投稿が残ること、リロード後も残ること(`OTDcolumns` の `filters.user.from_type`)、通知・Mentions・リストでも効き検索カラムには出ないこと、BTD 併用時に相互バッジと結果が一致すること。
+- 実機(2026-10-19): `localStorage.OTDalwaysUseLocalFiles = '1'` で、Home の Tweet authors に「mutual follows」が出ること(verified users の次)、選ぶと相互の人・自分・相互が絡む RT だけになり、要約が「by mutual follows」になりヘッダに Filtering by のアイコンが出ること、相互の人が非相互の人を引用した投稿が残ること、リロード後も残ること(`OTDcolumns` の `filters.user.from_type`)、通知・Mentions・リストでも効き検索カラムには出ないこと、BTD 併用時に相互バッジと結果が一致することを確認。
 
 ---
 
@@ -350,6 +349,6 @@ Phase 1 の副作用を先に潰すために扱った。変更は f8dc681(`src/i
 ## 進め方
 
 - Phase ごとに PR を分け、`tests/` に `node:test` のケースを足す。実行は `node --test tests/*.test.cjs`。
-- Phase 1 から Phase 5 までの実機確認は 2026-10-17 に問題なし。Phase 6 は 2026-10-18 に取得間隔だけ確認し、目視とブックマーク、フォローのまとめ通知(6-d)の確認が残っている。Phase 7 は 2026-10-18 に確認済み。Phase 8(相互フォローのフィルタ)は実機確認が未了。
+- Phase 1 から Phase 5 までの実機確認は 2026-10-17 に問題なし。Phase 6 は 2026-10-18 に取得間隔だけ確認し、目視とブックマーク、フォローのまとめ通知(6-d)の確認が残っている。Phase 7 は 2026-10-18 に確認済み。Phase 8 は 2026-10-19 に確認済み。
 - 残りは upstream への PR、Phase 5 で未対応の #321、Phase 6 の残課題(Home のクエリ ID)、Phase 7 の残課題(長文の Re-draft、返信制限の確認)、Phase 8 の残課題(「users I follow」のクライアント側への置き換え)。
 - upstream へは #554(RTL)、#552(Mentions)、Phase 1(92f0be5 / bfcbdd3)の順で PR を出す。起動ハングの修正は limex 氏の #562 が未マージで close されているので、出すならクレジット付きで出し直す。
